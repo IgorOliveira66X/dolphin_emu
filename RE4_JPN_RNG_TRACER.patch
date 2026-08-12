@@ -1,8 +1,11 @@
+diff --git a/RE4_JPN_RNG_TRACER_README.txt b/RE4_JPN_RNG_TRACER_README.txt
+new file mode 100644
+index 0000000..43a1e94
 --- /dev/null
 +++ b/RE4_JPN_RNG_TRACER_README.txt
-@@ -0,0 +1,70 @@
-+RE4 JPN RNG Tracer for Dolphin
-+================================
+@@ -0,0 +1,56 @@
++RE4 JPN RNG / Input / Drop Tracer v2 for Dolphin
++=================================================
 +
 +Target
 +------
@@ -10,70 +13,58 @@
 +RNG function: 0x8014BDA0
 +Global 16-bit RNG state: 0x802B69BC
 +
-+What this patch does
-+--------------------
-+1. Captures the exact GameCube controller state delivered to controller 1.
-+2. Hooks execution of 0x8014BDA0 in the x86-64 JIT and in the Interpreter.
-+3. For every RNG call, records:
-+   - global call index
-+   - movie frame
-+   - Dolphin input count
-+   - controller poll index
-+   - call number inside that poll
-+   - caller (LR - 4)
-+   - LR
-+   - seed before
-+   - predicted seed after
-+   - RNG output byte
-+   - buttons and all analog controller fields
-+4. Displays a small cyan OSD status line with the previous poll's RNG call count,
-+   total calls, last caller, seed transition, and current controller state.
-+5. Writes a CSV trace to:
-+   <Dolphin User Folder>/Logs/re4_jpn_rng_trace.csv
++Files produced
++--------------
++<Dolphin User Folder>/Logs/re4_jpn_rng_trace.csv
++  External RNG callers only. call_index still counts every RNG entry, including
++  internal calls, so RNG agenda offsets remain measurable without huge files.
 +
-+Important
-+---------
-+The "seed_after" column is calculated from the RE4 JPN RNG transformation that
-+was previously validated against the Japanese main.dol. The real seed_before
-+is read directly from emulated memory at 0x802B69BC on every call.
++<Dolphin User Folder>/Logs/re4_jpn_pad_trace.csv
++  One row for every controller-1 poll delivered to the game, even when no RNG
++  call happens. This resolves timing ambiguities between nearby movie inputs.
 +
-+The hook is active only for game ID G4BJ08.
++<Dolphin User Folder>/Logs/re4_jpn_drop_trace.csv
++  Register snapshots at known RE4 JPN drop-related PCs. Each row contains:
++  frame/input/poll, PC/label, seed, LR/CTR/CR/XER, controller state, and r0-r31.
++
++Drop probes
++-----------
++0x800D1978  drop path checkpoint
++0x800D1B34  drop path checkpoint
++0x800D1E9C  grenade type roll
++0x800D1EF0  grenade final-ID checkpoint
++0x800D224C  ammo/item path
++0x800D23F8  quantity checkpoint
++0x800D24B8  drop path checkpoint
++0x800D2770  drop path checkpoint
++0x800D2794  drop gate RNG call
++0x800D2798  immediately after drop-gate RNG
++0x800D27B0  drop path checkpoint
++0x800D2B64  selected drop path
++0x800D2BF0  ammo path checkpoint
++0x800D2FC0  late drop RNG checkpoint
++0x800D2FD0  late drop RNG call
++0x800D2FE0  late result pre-checkpoint
++0x800D2FE4  late result checkpoint
++0x800D2FF8  final return checkpoint
++
++Notes
++-----
++The labels describe our current reverse-engineering checkpoints; the raw PPC
++register dump is the source of truth. The first v2 tests with known outcomes
++(incendiary grenade and 10 handgun ammo) can be used to identify which register
++carries the final item ID and quantity at the labeled checkpoints.
 +
 +CPU cores
 +---------
-+- x86-64 JIT: supported (the normal Windows x64 Dolphin path)
++- x86-64 JIT: supported (normal Windows x64 Dolphin path)
 +- Interpreter: supported
 +- Cached Interpreter / ARM64 JIT: not instrumented by this patch
-+
-+Files changed
-+-------------
-+Source/Core/Core/RE4RNGTrace.cpp        (new)
-+Source/Core/Core/RE4RNGTrace.h          (new)
-+Source/Core/Core/Movie.cpp
-+Source/Core/Core/PowerPC/Jit64/Jit.cpp
-+Source/Core/Core/PowerPC/Interpreter/Interpreter.cpp
-+Source/Core/Core/CMakeLists.txt
-+Source/Core/VideoCommon/OnScreenDisplay.h
-+
-+About this ZIP
-+--------------
-+The GitHub source ZIP supplied for patching does not contain the contents of
-+Dolphin's git submodules. A complete build therefore needs either:
-+
-+  git clone --recursive https://github.com/dolphin-emu/dolphin.git
-+
-+or a checkout where the submodules have already been initialized. The included
-+RE4_JPN_RNG_TRACER.patch can be applied to such a checkout.
-+
-+Expected use for the TAS investigation
-+--------------------------------------
-+Run the optimized incendiary baseline and save re4_jpn_rng_trace.csv.
-+Then run a movie/input variation and save its CSV separately. Comparing the two
-+traces shows the first poll/caller where the RNG agenda diverges, which is the
-+key information needed to map input changes to RNG consumption without GDB.
+diff --git a/Source/Core/Core/CMakeLists.txt b/Source/Core/Core/CMakeLists.txt
+index 56c8dba..21a656a 100644
 --- a/Source/Core/Core/CMakeLists.txt
 +++ b/Source/Core/Core/CMakeLists.txt
-@@ -500,6 +500,8 @@
+@@ -500,6 +500,8 @@ add_library(core
    MemTools.h
    Movie.cpp
    Movie.h
@@ -82,6 +73,8 @@
    NetPlayClient.cpp
    NetPlayClient.h
    NetPlayCommon.cpp
+diff --git a/Source/Core/Core/Movie.cpp b/Source/Core/Core/Movie.cpp
+index 047fbfc..b760ef5 100644
 --- a/Source/Core/Core/Movie.cpp
 +++ b/Source/Core/Core/Movie.cpp
 @@ -58,6 +58,7 @@
@@ -92,7 +85,7 @@
  #include "Core/State.h"
  #include "Core/System.h"
  #include "Core/WiiUtils.h"
-@@ -190,6 +191,8 @@
+@@ -190,6 +191,8 @@ void MovieManager::FrameUpdate()
  // NOTE: EmuThread
  void MovieManager::Init(const BootParameters& boot)
  {
@@ -101,17 +94,17 @@
    if (std::holds_alternative<BootParameters::Disc>(boot.parameters))
      m_current_file_name = std::get<BootParameters::Disc>(boot.parameters).path;
    else
-@@ -764,6 +767,9 @@
-   m_has_disc_change = false;
+@@ -765,6 +768,9 @@ void MovieManager::CheckPadStatus(const GCPadStatus* PadStatus, int controllerID
    m_pad_state.reset = m_reset;
    m_reset = false;
-+
+ 
 +  Core::RE4RNGTrace::OnPadStatus(*PadStatus, controllerID, m_current_frame,
 +                                 m_current_input_count + 1);
- 
++
    {
      std::string display_str = GenerateInputDisplayString(m_pad_state, controllerID);
-@@ -1197,6 +1203,9 @@
+ 
+@@ -1197,6 +1203,9 @@ void MovieManager::PlayController(GCPadStatus* PadStatus, int controllerID)
    if (m_pad_state.reset)
      m_system.GetProcessorInterface().ResetButton_Tap();
  
@@ -121,6 +114,8 @@
    {
      std::string display_str = GenerateInputDisplayString(m_pad_state, controllerID);
  
+diff --git a/Source/Core/Core/PowerPC/Interpreter/Interpreter.cpp b/Source/Core/Core/PowerPC/Interpreter/Interpreter.cpp
+index 5ff6fa0..c856bcc 100644
 --- a/Source/Core/Core/PowerPC/Interpreter/Interpreter.cpp
 +++ b/Source/Core/Core/PowerPC/Interpreter/Interpreter.cpp
 @@ -22,6 +22,7 @@
@@ -131,16 +126,20 @@
  #include "Core/System.h"
  
  namespace
-@@ -117,6 +118,9 @@
+@@ -117,6 +118,11 @@ bool Interpreter::HandleFunctionHooking(u32 address)
  
  int Interpreter::SingleStepInner()
  {
 +  if (m_ppc_state.pc == Core::RE4RNGTrace::RNG_FUNCTION_ADDRESS)
 +    Core::RE4RNGTrace::OnRNGFunctionEntry(&m_system);
++  if (Core::RE4RNGTrace::IsDropProbeAddress(m_ppc_state.pc))
++    Core::RE4RNGTrace::OnDropProbeEntry(&m_system, m_ppc_state.pc);
 +
    if (HandleFunctionHooking(m_ppc_state.pc))
    {
      UpdatePC();
+diff --git a/Source/Core/Core/PowerPC/Jit64/Jit.cpp b/Source/Core/Core/PowerPC/Jit64/Jit.cpp
+index 1248b1a..408bf5b 100644
 --- a/Source/Core/Core/PowerPC/Jit64/Jit.cpp
 +++ b/Source/Core/Core/PowerPC/Jit64/Jit.cpp
 @@ -45,6 +45,7 @@
@@ -151,31 +150,40 @@
  #include "Core/PowerPC/PowerPC.h"
  #include "Core/System.h"
  
-@@ -1067,6 +1068,16 @@
+@@ -1067,6 +1068,21 @@ bool Jit64::DoJit(u32 em_address, JitBlock* b, u32 nextPC)
      if (HandleFunctionHooking(op.address))
        break;
  
-+    if (op.address == Core::RE4RNGTrace::RNG_FUNCTION_ADDRESS)
++    const bool is_re4_rng = op.address == Core::RE4RNGTrace::RNG_FUNCTION_ADDRESS;
++    const bool is_re4_drop_probe = Core::RE4RNGTrace::IsDropProbeAddress(op.address);
++    if (is_re4_rng || is_re4_drop_probe)
 +    {
 +      gpr.Flush();
 +      fpr.Flush();
 +
 +      ABI_PushRegistersAndAdjustStack({}, 0);
-+      ABI_CallFunctionP(Core::RE4RNGTrace::OnRNGFunctionEntry, &m_system);
++      if (is_re4_rng)
++        ABI_CallFunctionP(Core::RE4RNGTrace::OnRNGFunctionEntry, &m_system);
++      if (is_re4_drop_probe)
++        ABI_CallFunctionPC(Core::RE4RNGTrace::OnDropProbeEntry, &m_system, op.address);
 +      ABI_PopRegistersAndAdjustStack({}, 0);
 +    }
 +
      if (op.skip)
      {
        if (IsBranchWatchEnabled())
+diff --git a/Source/Core/Core/RE4RNGTrace.cpp b/Source/Core/Core/RE4RNGTrace.cpp
+new file mode 100644
+index 0000000..5a7f868
 --- /dev/null
 +++ b/Source/Core/Core/RE4RNGTrace.cpp
-@@ -0,0 +1,211 @@
+@@ -0,0 +1,383 @@
 +// Copyright 2026 Dolphin Emulator Project
 +// SPDX-License-Identifier: GPL-2.0-or-later
 +
 +#include "Core/RE4RNGTrace.h"
 +
++#include <array>
 +#include <fstream>
 +#include <mutex>
 +#include <string>
@@ -198,7 +206,9 @@
 +namespace
 +{
 +constexpr std::string_view TARGET_GAME_ID = "G4BJ08";
-+constexpr std::string_view TRACE_FILENAME = "re4_jpn_rng_trace.csv";
++constexpr std::string_view RNG_TRACE_FILENAME = "re4_jpn_rng_trace.csv";
++constexpr std::string_view PAD_TRACE_FILENAME = "re4_jpn_pad_trace.csv";
++constexpr std::string_view DROP_TRACE_FILENAME = "re4_jpn_drop_trace.csv";
 +
 +struct InputSnapshot
 +{
@@ -221,14 +231,18 @@
 +  u64 input_count = 0;
 +  u64 poll_index = 0;
 +  u64 total_calls = 0;
++  u64 external_calls = 0;
 +  u64 calls_this_poll = 0;
 +  u64 calls_previous_poll = 0;
++  u64 drop_probe_index = 0;
 +  u32 last_caller = 0;
 +  u16 last_seed_before = 0;
 +  u16 last_seed_after = 0;
 +  u8 last_rng_byte = 0;
 +  InputSnapshot input{};
-+  std::ofstream log;
++  std::ofstream rng_log;
++  std::ofstream pad_log;
++  std::ofstream drop_log;
 +};
 +
 +std::mutex s_mutex;
@@ -237,6 +251,13 @@
 +bool IsTargetGame()
 +{
 +  return SConfig::GetInstance().GetGameID() == TARGET_GAME_ID;
++}
++
++bool IsInternalRNGCaller(u32 caller)
++{
++  // Calls made from inside the RNG routine itself dominate the v1 log and are not useful for
++  // input-to-callsite comparisons. We still count them in total_calls; we simply do not emit rows.
++  return caller >= 0x8014BDA0 && caller <= 0x8014BE60;
 +}
 +
 +std::pair<u16, u8> NextRNG(u16 old_seed)
@@ -252,19 +273,98 @@
 +  return {next, static_cast<u8>(next >> 8)};
 +}
 +
-+void OpenTraceFile()
++std::string_view DropProbeLabel(u32 pc)
++{
++  switch (pc)
++  {
++  case 0x800D1978:
++    return "drop_path_1978";
++  case 0x800D1B34:
++    return "drop_path_1B34";
++  case 0x800D1E9C:
++    return "grenade_type_roll";
++  case 0x800D1EF0:
++    return "grenade_final_id_checkpoint";
++  case 0x800D224C:
++    return "ammo_item_path";
++  case 0x800D23F8:
++    return "quantity_checkpoint";
++  case 0x800D24B8:
++    return "drop_path_24B8";
++  case 0x800D2770:
++    return "drop_path_2770";
++  case 0x800D2794:
++    return "drop_gate_rng_call";
++  case 0x800D2798:
++    return "drop_gate_after_rng";
++  case 0x800D27B0:
++    return "drop_path_27B0";
++  case 0x800D2B64:
++    return "drop_selected_path";
++  case 0x800D2BF0:
++    return "ammo_path_checkpoint";
++  case 0x800D2FC0:
++    return "late_drop_rng_checkpoint";
++  case 0x800D2FD0:
++    return "late_drop_rng_call";
++  case 0x800D2FE0:
++    return "late_drop_result_pre";
++  case 0x800D2FE4:
++    return "late_drop_result";
++  case 0x800D2FF8:
++    return "drop_final_return";
++  default:
++    return "unknown";
++  }
++}
++
++void OpenTraceFiles()
 +{
 +  File::CreateFullPath(File::GetUserPath(D_LOGS_IDX));
-+  const std::string path = File::GetUserPath(D_LOGS_IDX) + std::string(TRACE_FILENAME);
-+  s_state.log = std::ofstream(path, std::ios::out | std::ios::trunc);
-+  if (!s_state.log)
++  const std::string logs_path = File::GetUserPath(D_LOGS_IDX);
++
++  s_state.rng_log =
++      std::ofstream(logs_path + std::string(RNG_TRACE_FILENAME), std::ios::out | std::ios::trunc);
++  s_state.pad_log =
++      std::ofstream(logs_path + std::string(PAD_TRACE_FILENAME), std::ios::out | std::ios::trunc);
++  s_state.drop_log =
++      std::ofstream(logs_path + std::string(DROP_TRACE_FILENAME), std::ios::out | std::ios::trunc);
++
++  if (s_state.rng_log)
++  {
++    s_state.rng_log
++        << "call_index,external_index,frame,input_count,poll_index,call_in_poll,caller,lr,"
++           "seed_before,seed_after,rng_byte,buttons,stick_x,stick_y,cstick_x,cstick_y,"
++           "trigger_l,trigger_r,analog_a,analog_b,connected\n";
++    s_state.rng_log.flush();
++  }
++
++  if (s_state.pad_log)
++  {
++    s_state.pad_log
++        << "poll_index,frame,input_count,rng_calls_previous_poll,buttons,stick_x,stick_y,"
++           "cstick_x,cstick_y,trigger_l,trigger_r,analog_a,analog_b,connected\n";
++    s_state.pad_log.flush();
++  }
++
++  if (s_state.drop_log)
++  {
++    s_state.drop_log
++        << "probe_index,frame,input_count,poll_index,pc,label,seed,lr,ctr,cr,xer,"
++           "buttons,stick_x,stick_y,cstick_x,cstick_y,trigger_l,trigger_r,analog_a,analog_b,"
++           "r0,r1,r2,r3,r4,r5,r6,r7,r8,r9,r10,r11,r12,r13,r14,r15,r16,r17,r18,r19,"
++           "r20,r21,r22,r23,r24,r25,r26,r27,r28,r29,r30,r31\n";
++    s_state.drop_log.flush();
++  }
++}
++
++void EnsureActive()
++{
++  if (s_state.active)
 +    return;
 +
-+  s_state.log
-+      << "call_index,frame,input_count,poll_index,call_in_poll,caller,lr,"
-+         "seed_before,seed_after,rng_byte,buttons,stick_x,stick_y,cstick_x,cstick_y,"
-+         "trigger_l,trigger_r,analog_a,analog_b,connected\n";
-+  s_state.log.flush();
++  s_state.active = true;
++  OpenTraceFiles();
 +}
 +
 +void UpdateHUD()
@@ -273,35 +373,68 @@
 +    return;
 +
 +  const std::string text = fmt::format(
-+      "RE4 RNG | F:{} Poll:{} PrevCalls:{} Total:{}\n"
++      "RE4 RNG v2 | F:{} Poll:{} PrevCalls:{} Total:{} Ext:{}\n"
 +      "Caller:${:08X} Seed:${:04X}->${:04X} Byte:${:02X} Btn:${:04X} "
 +      "LS:{:02X},{:02X} CS:{:02X},{:02X}",
 +      s_state.frame, s_state.poll_index, s_state.calls_previous_poll, s_state.total_calls,
-+      s_state.last_caller, s_state.last_seed_before, s_state.last_seed_after,
-+      s_state.last_rng_byte, s_state.input.buttons, s_state.input.stick_x,
-+      s_state.input.stick_y, s_state.input.cstick_x, s_state.input.cstick_y);
++      s_state.external_calls, s_state.last_caller, s_state.last_seed_before,
++      s_state.last_seed_after, s_state.last_rng_byte, s_state.input.buttons,
++      s_state.input.stick_x, s_state.input.stick_y, s_state.input.cstick_x,
++      s_state.input.cstick_y);
 +
 +  OSD::AddTypedMessage(OSD::MessageType::RE4RNGTrace, text, OSD::Duration::VERY_LONG,
 +                       OSD::Color::CYAN);
 +}
 +}  // namespace
 +
++bool IsDropProbeAddress(u32 pc)
++{
++  switch (pc)
++  {
++  case 0x800D1978:
++  case 0x800D1B34:
++  case 0x800D1E9C:
++  case 0x800D1EF0:
++  case 0x800D224C:
++  case 0x800D23F8:
++  case 0x800D24B8:
++  case 0x800D2770:
++  case 0x800D2794:
++  case 0x800D2798:
++  case 0x800D27B0:
++  case 0x800D2B64:
++  case 0x800D2BF0:
++  case 0x800D2FC0:
++  case 0x800D2FD0:
++  case 0x800D2FE0:
++  case 0x800D2FE4:
++  case 0x800D2FF8:
++    return true;
++  default:
++    return false;
++  }
++}
++
 +void ResetSession()
 +{
 +  std::lock_guard lock{s_mutex};
 +
-+  if (s_state.log.is_open())
-+    s_state.log.close();
++  if (s_state.rng_log.is_open())
++    s_state.rng_log.close();
++  if (s_state.pad_log.is_open())
++    s_state.pad_log.close();
++  if (s_state.drop_log.is_open())
++    s_state.drop_log.close();
 +
 +  s_state = TraceState{};
 +  s_state.active = IsTargetGame();
 +  if (!s_state.active)
 +    return;
 +
-+  OpenTraceFile();
++  OpenTraceFiles();
 +  OSD::AddTypedMessage(
 +      OSD::MessageType::RE4RNGTrace,
-+      fmt::format("RE4 JPN RNG tracer armed | ${:08X} | seed @ ${:08X}",
++      fmt::format("RE4 JPN RNG tracer v2 armed | RNG ${:08X} | seed ${:08X} | drop probes ON",
 +                  RNG_FUNCTION_ADDRESS, RNG_STATE_ADDRESS),
 +      OSD::Duration::VERY_LONG, OSD::Color::GREEN);
 +}
@@ -312,11 +445,7 @@
 +    return;
 +
 +  std::lock_guard lock{s_mutex};
-+  if (!s_state.active)
-+  {
-+    s_state.active = true;
-+    OpenTraceFile();
-+  }
++  EnsureActive();
 +
 +  s_state.calls_previous_poll = s_state.calls_this_poll;
 +  s_state.calls_this_poll = 0;
@@ -335,6 +464,19 @@
 +  s_state.input.analog_b = pad_status.analogB;
 +  s_state.input.connected = pad_status.isConnected;
 +
++  if (s_state.pad_log)
++  {
++    s_state.pad_log << fmt::format(
++        "{},{},{},{},${:04X},{},{},{},{},{},{},{},{},{}\n", s_state.poll_index,
++        s_state.frame, s_state.input_count, s_state.calls_previous_poll, s_state.input.buttons,
++        s_state.input.stick_x, s_state.input.stick_y, s_state.input.cstick_x,
++        s_state.input.cstick_y, s_state.input.trigger_l, s_state.input.trigger_r,
++        s_state.input.analog_a, s_state.input.analog_b, s_state.input.connected ? 1 : 0);
++
++    if ((s_state.poll_index & 0x3F) == 0)
++      s_state.pad_log.flush();
++  }
++
 +  UpdateHUD();
 +}
 +
@@ -350,11 +492,7 @@
 +  const auto [seed_after, rng_byte] = NextRNG(seed_before);
 +
 +  std::lock_guard lock{s_mutex};
-+  if (!s_state.active)
-+  {
-+    s_state.active = true;
-+    OpenTraceFile();
-+  }
++  EnsureActive();
 +
 +  ++s_state.total_calls;
 +  ++s_state.calls_this_poll;
@@ -363,28 +501,72 @@
 +  s_state.last_seed_after = seed_after;
 +  s_state.last_rng_byte = rng_byte;
 +
-+  if (s_state.log)
++  if (IsInternalRNGCaller(caller))
++    return;
++
++  ++s_state.external_calls;
++  if (s_state.rng_log)
 +  {
-+    s_state.log << fmt::format(
-+        "{},{},{},{},{},${:08X},${:08X},${:04X},${:04X},${:02X},${:04X},"
++    s_state.rng_log << fmt::format(
++        "{},{},{},{},{},{},${:08X},${:08X},${:04X},${:04X},${:02X},${:04X},"
 +        "{},{},{},{},{},{},{},{},{}\n",
-+        s_state.total_calls, s_state.frame, s_state.input_count, s_state.poll_index,
-+        s_state.calls_this_poll, caller, lr, seed_before, seed_after, rng_byte,
++        s_state.total_calls, s_state.external_calls, s_state.frame, s_state.input_count,
++        s_state.poll_index, s_state.calls_this_poll, caller, lr, seed_before, seed_after, rng_byte,
 +        s_state.input.buttons, s_state.input.stick_x, s_state.input.stick_y,
 +        s_state.input.cstick_x, s_state.input.cstick_y, s_state.input.trigger_l,
 +        s_state.input.trigger_r, s_state.input.analog_a, s_state.input.analog_b,
 +        s_state.input.connected ? 1 : 0);
 +
-+    // Keep the trace durable without forcing a flush for every single RNG call.
-+    if ((s_state.total_calls & 0xFF) == 0)
-+      s_state.log.flush();
++    if ((s_state.external_calls & 0x3F) == 0)
++      s_state.rng_log.flush();
 +  }
 +}
 +
++void OnDropProbeEntry(System* system, u32 pc)
++{
++  if (system == nullptr || !IsTargetGame() || !IsDropProbeAddress(pc))
++    return;
++
++  const auto& ppc_state = system->GetPowerPC().GetPPCState();
++  const u16 seed = system->GetMemory().Read_U16(RNG_STATE_ADDRESS);
++  const u32 lr = ppc_state.spr[SPR_LR];
++  const u32 ctr = ppc_state.spr[SPR_CTR];
++  const u32 cr = ppc_state.cr.Get();
++  const u32 xer = ppc_state.GetXER().Hex;
++
++  std::lock_guard lock{s_mutex};
++  EnsureActive();
++  ++s_state.drop_probe_index;
++
++  if (!s_state.drop_log)
++    return;
++
++  s_state.drop_log << fmt::format(
++      "{},{},{},{},${:08X},{},${:04X},${:08X},${:08X},${:08X},${:08X},"
++      "${:04X},{},{},{},{},{},{},{},{},",
++      s_state.drop_probe_index, s_state.frame, s_state.input_count, s_state.poll_index, pc,
++      DropProbeLabel(pc), seed, lr, ctr, cr, xer, s_state.input.buttons, s_state.input.stick_x,
++      s_state.input.stick_y, s_state.input.cstick_x, s_state.input.cstick_y,
++      s_state.input.trigger_l, s_state.input.trigger_r, s_state.input.analog_a,
++      s_state.input.analog_b);
++
++  for (size_t i = 0; i < std::size(ppc_state.gpr); ++i)
++  {
++    if (i != 0)
++      s_state.drop_log << ',';
++    s_state.drop_log << fmt::format("${:08X}", ppc_state.gpr[i]);
++  }
++  s_state.drop_log << '\n';
++  s_state.drop_log.flush();
++}
++
 +}  // namespace Core::RE4RNGTrace
+diff --git a/Source/Core/Core/RE4RNGTrace.h b/Source/Core/Core/RE4RNGTrace.h
+new file mode 100644
+index 0000000..d2ecef3
 --- /dev/null
 +++ b/Source/Core/Core/RE4RNGTrace.h
-@@ -0,0 +1,31 @@
+@@ -0,0 +1,36 @@
 +// Copyright 2026 Dolphin Emulator Project
 +// SPDX-License-Identifier: GPL-2.0-or-later
 +
@@ -407,18 +589,25 @@
 +// For other games this is a no-op.
 +void ResetSession();
 +
-+// Captures the exact GameCube controller state delivered to the game.
-+// frame/input_count are Dolphin movie counters; poll_index is tracked internally.
++// Captures every GameCube controller poll delivered to controller 1.
 +void OnPadStatus(const GCPadStatus& pad_status, int controller_id, u64 frame, u64 input_count);
 +
 +// Called at the entry of $8014BDA0 on the emulated CPU thread.
 +void OnRNGFunctionEntry(System* system);
 +
++// True for RE4 JPN drop-related PCs instrumented by the tracer.
++bool IsDropProbeAddress(u32 pc);
++
++// Called before executing a drop-related instruction. Dumps PPC register state.
++void OnDropProbeEntry(System* system, u32 pc);
++
 +}  // namespace RE4RNGTrace
 +}  // namespace Core
+diff --git a/Source/Core/VideoCommon/OnScreenDisplay.h b/Source/Core/VideoCommon/OnScreenDisplay.h
+index 2819de5..7f7bdfe 100644
 --- a/Source/Core/VideoCommon/OnScreenDisplay.h
 +++ b/Source/Core/VideoCommon/OnScreenDisplay.h
-@@ -18,6 +18,7 @@
+@@ -18,6 +18,7 @@ enum class MessageType
  {
    NetPlayPing,
    NetPlayBuffer,
