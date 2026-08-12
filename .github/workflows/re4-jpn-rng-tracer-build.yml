@@ -1,4 +1,4 @@
-name: Build RE4 JPN RNG Tracer
+name: Build RE4 JPN RNG Tracer v2
 
 on:
   workflow_dispatch:
@@ -24,7 +24,7 @@ jobs:
           submodules: recursive
           fetch-depth: 1
 
-      - name: Verify and apply RE4 JPN RNG tracer patch
+      - name: Verify and apply RE4 JPN RNG tracer v2 patch
         shell: pwsh
         run: |
           git apply --check RE4_JPN_RNG_TRACER.patch
@@ -42,10 +42,10 @@ jobs:
           if (-not $exe) { throw 'Dolphin.exe was not produced.' }
           Write-Host "Built executable: $($exe.FullName)"
 
-      - name: Upload portable Dolphin build
+      - name: Upload portable Dolphin v2 build
         uses: actions/upload-artifact@v4
         with:
-          name: Dolphin-RE4-JPN-RNG-Tracer-Windows-x64
+          name: Dolphin-RE4-JPN-RNG-Tracer-v2-Windows-x64
           path: build/release/x64/Binaries/**
           if-no-files-found: error
           compression-level: 6
