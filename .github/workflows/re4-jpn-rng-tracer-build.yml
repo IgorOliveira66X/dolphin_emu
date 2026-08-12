@@ -1,0 +1,52 @@
+name: Build RE4 JPN RNG Tracer
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - master
+    paths:
+      - .github/workflows/re4-jpn-rng-tracer-build.yml
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: windows-2025-vs2026
+    timeout-minutes: 120
+
+    steps:
+      - name: Checkout tracer branch with submodules
+        uses: actions/checkout@v4
+        with:
+          ref: agent/re4-jpn-rng-tracer
+          submodules: recursive
+          fetch-depth: 1
+
+      - name: Verify and apply RE4 JPN RNG tracer patch
+        shell: pwsh
+        run: |
+          git apply --check RE4_JPN_RNG_TRACER.patch
+          git apply RE4_JPN_RNG_TRACER.patch
+          git diff --check
+
+      - name: Configure and build Release x64
+        shell: pwsh
+        run: cmake --workflow --preset visualstudio-release-x64
+
+      - name: Verify Dolphin executable
+        shell: pwsh
+        run: |
+          $exe = Get-ChildItem -Path build/release/x64/Binaries -Filter Dolphin.exe -Recurse | Select-Object -First 1
+          if (-not $exe) { throw 'Dolphin.exe was not produced.' }
+          Write-Host "Built executable: $($exe.FullName)"
+
+      - name: Upload portable Dolphin build
+        uses: actions/upload-artifact@v4
+        with:
+          name: Dolphin-RE4-JPN-RNG-Tracer-Windows-x64
+          path: build/release/x64/Binaries/**
+          if-no-files-found: error
+          compression-level: 6
+          retention-days: 30
