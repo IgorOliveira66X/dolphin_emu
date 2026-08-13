@@ -1,0 +1,70 @@
+diff --git a/Source/Core/Core/CMakeLists.txt b/Source/Core/Core/CMakeLists.txt
+index 21a656a..51a62f5 100644
+--- a/Source/Core/Core/CMakeLists.txt
++++ b/Source/Core/Core/CMakeLists.txt
+@@ -500,6 +500,8 @@ add_library(core
+   MemTools.h
+   Movie.cpp
+   Movie.h
++  RE4RNGBenchmark.cpp
++  RE4RNGBenchmark.h
+   RE4RNGTrace.cpp
+   RE4RNGTrace.h
+   NetPlayClient.cpp
+diff --git a/Source/Core/Core/PowerPC/Jit64/Jit.cpp b/Source/Core/Core/PowerPC/Jit64/Jit.cpp
+index 408bf5b..482b867 100644
+--- a/Source/Core/Core/PowerPC/Jit64/Jit.cpp
++++ b/Source/Core/Core/PowerPC/Jit64/Jit.cpp
+@@ -1068,7 +1068,9 @@ bool Jit64::DoJit(u32 em_address, JitBlock* b, u32 nextPC)
+     if (HandleFunctionHooking(op.address))
+       break;
+ 
+-    const bool is_re4_rng = op.address == Core::RE4RNGTrace::RNG_FUNCTION_ADDRESS;
++    // The v3 benchmark measures search throughput, not tracer overhead. The RNG-entry callback
++    // requires GPR/FPR flushes on every RNG call, so disable it in this benchmark build.
++    const bool is_re4_rng = false;
+     const bool is_re4_drop_probe = Core::RE4RNGTrace::IsDropProbeAddress(op.address);
+     if (is_re4_rng || is_re4_drop_probe)
+     {
+diff --git a/Source/Core/Core/RE4RNGBenchmark.cpp b/Source/Core/Core/RE4RNGBenchmark.cpp
+new file mode 100644
+index 0000000..5028a07
+--- /dev/null
++++ b/Source/Core/Core/RE4RNGBenchmark.cpp
+@@ -0,0 +1,822 @@
++// Copyright 2026 Dolphin Emulator Project
++// SPDX-License-Identifier: GPL-2.0-or-later
++
++#include "Core/RE4RNGBenchmark.h"
++
++#include <algorithm>
++#include <array>
++#include <atomic>
++#include <chrono>
++#include <cstdint>
++#include <fstream>
++#include <limits>
++#include <mutex>
++#include <span>
++#include <string>
++#include <string_view>
++#include <vector>
++
++#include <fmt/format.h>
++
++#include "Common/Config/Config.h"
++#include "Common/FileUtil.h"
++#include "Core/Config/MainSettings.h"
++#include "Core/HW/CPU.h"
++#include "Core/HW/Memmap.h"
++#include "Core/PowerPC/Gekko.h"
++#include "Core/PowerPC/PowerPC.h"
++#include "Core/State.h"
++#include "Core/System.h"
++#include "InputCommon/GCPadStatus.h"
++#include "VideoCommon/OnScreenDisplay.h"
++
++namespace Core::RE4RNGBenchmark
++{
++namespace
++{
