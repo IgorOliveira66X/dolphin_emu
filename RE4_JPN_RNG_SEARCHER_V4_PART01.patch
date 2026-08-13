@@ -1,0 +1,232 @@
++      << "attempt,phase,mutation_count,mutation1,mutation2,mutation3,gate_seen,gate_seed,"
++         "grenade_seen,grenade_seed,final_id_seen,final_id,hand_found,elapsed_ms\n";
++  s_state.result_log.flush();
++}
++
++void BuildPrimitivesLocked()
++{
++  s_state.primitives.clear();
++  constexpr std::array kinds = {
++      MutationKind::BOff,       MutationKind::LOn,        MutationKind::ROn,
++      MutationKind::StickXMinus, MutationKind::StickXPlus, MutationKind::StickYMinus,
++      MutationKind::StickYPlus,
++  };
++
++  for (u64 frame = MUTATION_FIRST_FRAME; frame <= MUTATION_LAST_FRAME;
++       frame += MUTATION_FRAME_STEP)
++  {
++    for (MutationKind kind : kinds)
++      s_state.primitives.push_back({frame, kind});
++  }
++}
++
++void BuildPhase1Locked()
++{
++  s_state.plans.clear();
++  s_state.plans.reserve(MAX_ATTEMPTS);
++
++  AttemptPlan baseline{};
++  baseline.attempt_id = 0;
++  baseline.phase = 0;
++  s_state.plans.push_back(baseline);
++
++  // Two known outcomes from manual testing validate that automatic movie-input injection matches
++  // the user's edits before the broad search begins.
++  AttemptPlan validate_b{};
++  validate_b.attempt_id = s_state.plans.size();
++  validate_b.phase = 9;
++  validate_b.mutation_count = 1;
++  validate_b.mutations[0] = {2866, MutationKind::BOff};
++  s_state.plans.push_back(validate_b);
++
++  AttemptPlan validate_incendiary{};
++  validate_incendiary.attempt_id = s_state.plans.size();
++  validate_incendiary.phase = 9;
++  validate_incendiary.mutation_count = 2;
++  validate_incendiary.mutations[0] = {2864, MutationKind::LOn};
++  validate_incendiary.mutations[1] = {2866, MutationKind::LOn};
++  s_state.plans.push_back(validate_incendiary);
++
++  for (const Mutation& mutation : s_state.primitives)
++  {
++    AttemptPlan plan{};
++    plan.attempt_id = s_state.plans.size();
++    plan.phase = 1;
++    plan.mutation_count = 1;
++    plan.mutations[0] = mutation;
++    s_state.plans.push_back(plan);
++  }
++}
++
++bool SameSignature(const AttemptResult& a, const AttemptResult& b)
++{
++  return a.gate_seen == b.gate_seen && (!a.gate_seen || a.gate_seed == b.gate_seed) &&
++         a.grenade_seen == b.grenade_seen &&
++         (!a.grenade_seen || a.grenade_seed == b.grenade_seed) &&
++         a.final_id_seen == b.final_id_seen && (!a.final_id_seen || a.final_id == b.final_id);
++}
++
++bool IsInterestingSingle(const AttemptResult& result)
++{
++  if (!s_state.baseline_recorded)
++    return true;
++  return !SameSignature(result, s_state.baseline_result);
++}
++
++void SelectSinglesLocked()
++{
++  struct Representative
++  {
++    AttemptResult signature{};
++    std::size_t count = 0;
++  };
++
++  std::vector<Representative> signatures;
++  std::vector<Mutation> differing;
++  std::array<std::vector<Mutation>, 7> baseline_equivalent_by_kind;
++
++  for (const SingleOutcome& outcome : s_state.singles)
++  {
++    if (!IsInterestingSingle(outcome.result))
++    {
++      baseline_equivalent_by_kind[static_cast<std::size_t>(outcome.mutation.kind)].push_back(
++          outcome.mutation);
++      continue;
++    }
++
++    auto it = std::find_if(signatures.begin(), signatures.end(), [&](const Representative& rep) {
++      return SameSignature(rep.signature, outcome.result);
++    });
++
++    if (it == signatures.end())
++    {
++      signatures.push_back({outcome.result, 1});
++      differing.push_back(outcome.mutation);
++    }
++    else if (it->count < MAX_REPRESENTATIVES_PER_SIGNATURE)
++    {
++      ++it->count;
++      differing.push_back(outcome.mutation);
++    }
++  }
++
++  s_state.selected_singles.clear();
++
++  if (differing.size() <= MAX_SELECTED_SINGLES - 14)
++  {
++    s_state.selected_singles = differing;
++  }
++  else
++  {
++    const std::size_t target = MAX_SELECTED_SINGLES - 14;
++    for (std::size_t i = 0; i < target; ++i)
++    {
++      const std::size_t index = i * differing.size() / target;
++      s_state.selected_singles.push_back(differing[index]);
++    }
++  }
++
++  // Preserve a small spatially diverse sample of mutations which look baseline-equivalent alone;
++  // nonlinear interactions can still make them useful in pairs/triples.
++  for (const auto& group : baseline_equivalent_by_kind)
++  {
++    if (group.empty() || s_state.selected_singles.size() >= MAX_SELECTED_SINGLES)
++      continue;
++    s_state.selected_singles.push_back(group.front());
++    if (group.size() > 1 && s_state.selected_singles.size() < MAX_SELECTED_SINGLES)
++      s_state.selected_singles.push_back(group.back());
++  }
++}
++
++void BuildPhase2Locked()
++{
++  if (s_state.phase2_built)
++    return;
++  s_state.phase2_built = true;
++  SelectSinglesLocked();
++
++  const std::size_t n = s_state.selected_singles.size();
++  for (std::size_t i = 0; i < n && s_state.plans.size() < MAX_ATTEMPTS; ++i)
++  {
++    for (std::size_t j = i + 1; j < n && s_state.plans.size() < MAX_ATTEMPTS; ++j)
++    {
++      const Mutation& a = s_state.selected_singles[i];
++      const Mutation& b = s_state.selected_singles[j];
++      if (!Compatible(a, b))
++        continue;
++
++      AttemptPlan plan{};
++      plan.attempt_id = s_state.plans.size();
++      plan.phase = 2;
++      plan.mutation_count = 2;
++      plan.mutations[0] = a;
++      plan.mutations[1] = b;
++      s_state.plans.push_back(plan);
++    }
++  }
++}
++
++void BuildPhase3Locked()
++{
++  if (s_state.phase3_built || s_state.plans.size() >= MAX_ATTEMPTS)
++    return;
++  s_state.phase3_built = true;
++
++  const std::size_t n = s_state.selected_singles.size();
++  for (std::size_t i = 0; i < n && s_state.plans.size() < MAX_ATTEMPTS; ++i)
++  {
++    for (std::size_t j = i + 1; j < n && s_state.plans.size() < MAX_ATTEMPTS; ++j)
++    {
++      for (std::size_t k = j + 1; k < n && s_state.plans.size() < MAX_ATTEMPTS; ++k)
++      {
++        const Mutation& a = s_state.selected_singles[i];
++        const Mutation& b = s_state.selected_singles[j];
++        const Mutation& c = s_state.selected_singles[k];
++        if (!Compatible(a, b, c))
++          continue;
++
++        AttemptPlan plan{};
++        plan.attempt_id = s_state.plans.size();
++        plan.phase = 3;
++        plan.mutation_count = 3;
++        plan.mutations[0] = a;
++        plan.mutations[1] = b;
++        plan.mutations[2] = c;
++        s_state.plans.push_back(plan);
++      }
++    }
++  }
++}
++
++void WriteAttemptLocked(const AttemptPlan& plan, const AttemptResult& result)
++{
++  if (!s_state.result_log)
++    return;
++
++  std::array<std::string, 3> text{};
++  for (u8 i = 0; i < plan.mutation_count; ++i)
++    text[i] = MutationText(plan.mutations[i]);
++
++  const double elapsed_ms =
++      std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() -
++                                               s_state.start_time)
++          .count();
++
++  s_state.result_log << fmt::format(
++      "{},{},{},{},{},{},{},${:04X},{},${:04X},{},{}, {},{:.3f}\n", plan.attempt_id,
++      plan.phase, plan.mutation_count, text[0], text[1], text[2], result.gate_seen ? 1 : 0,
++      result.gate_seed, result.grenade_seen ? 1 : 0, result.grenade_seed,
++      result.final_id_seen ? 1 : 0, result.final_id, result.hand_found ? 1 : 0, elapsed_ms);
++
++  if ((plan.attempt_id & 0x3F) == 0 || result.hand_found)
++    s_state.result_log.flush();
++}
++
++void WriteFoundLocked(const AttemptPlan& plan, const AttemptResult& result)
++{
++  File::CreateFullPath(File::GetUserPath(D_LOGS_IDX));
++  const std::string path = File::GetUserPath(D_LOGS_IDX) + std::string(FOUND_FILENAME);
++  std::ofstream out(path, std::ios::out | std::ios::trunc);
++  if (!out)
++    return;
++
