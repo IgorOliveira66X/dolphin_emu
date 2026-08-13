@@ -1,53 +1,89 @@
+diff --git a/RE4_JPN_RNG_SEARCH_V4_README.txt b/RE4_JPN_RNG_SEARCH_V4_README.txt
+new file mode 100644
+index 0000000..3d08fc9
+--- /dev/null
++++ b/RE4_JPN_RNG_SEARCH_V4_README.txt
+@@ -0,0 +1,24 @@
++RE4 JPN RNG Search v4 — internal in-memory searcher
++
++Target movie: neutral first-Ganado baseline (Leon runs forward, no drop).
++Automatic capture: movie frame 2818.
++Mutation window: even TAS slots 2822..2910.
++Budget: 5000 attempts.
++Target: $800D1EF0 r29 == 1.
++
++Mandatory self-checks before search:
++1) baseline gate $42B3
++2) release B at 2866 -> gate $47AC
++3) press L at 2864+2866 -> gate $D62C, route $BE42, final ID 2
++
++If any check fails, search aborts.
++
++Logs:
++  Logs/re4_jpn_rng_search_results.csv
++  Logs/re4_jpn_rng_search_FOUND.txt (only on success)
++
++Search phases:
++  validation -> 315 singles -> pairs of influential singles -> triples
++
++Mutation labels:
++  B_OFF, L, R, SX-8, SX+8, SY-8, SY+8
 diff --git a/Source/Core/Core/CMakeLists.txt b/Source/Core/Core/CMakeLists.txt
-index 21a656a..51a62f5 100644
+index 21a656a..cce0cbe 100644
 --- a/Source/Core/Core/CMakeLists.txt
 +++ b/Source/Core/Core/CMakeLists.txt
 @@ -500,6 +500,8 @@ add_library(core
    MemTools.h
    Movie.cpp
    Movie.h
-+  RE4RNGBenchmark.cpp
-+  RE4RNGBenchmark.h
++  RE4RNGSearch.cpp
++  RE4RNGSearch.h
    RE4RNGTrace.cpp
    RE4RNGTrace.h
    NetPlayClient.cpp
-diff --git a/Source/Core/Core/PowerPC/Jit64/Jit.cpp b/Source/Core/Core/PowerPC/Jit64/Jit.cpp
-index 408bf5b..482b867 100644
---- a/Source/Core/Core/PowerPC/Jit64/Jit.cpp
-+++ b/Source/Core/Core/PowerPC/Jit64/Jit.cpp
-@@ -1068,7 +1068,9 @@ bool Jit64::DoJit(u32 em_address, JitBlock* b, u32 nextPC)
-     if (HandleFunctionHooking(op.address))
-       break;
+diff --git a/Source/Core/Core/Movie.cpp b/Source/Core/Core/Movie.cpp
+index b760ef5..f33b9bd 100644
+--- a/Source/Core/Core/Movie.cpp
++++ b/Source/Core/Core/Movie.cpp
+@@ -58,6 +58,7 @@
+ #include "Core/IOS/USB/Bluetooth/BTEmu.h"
+ #include "Core/IOS/USB/Bluetooth/WiimoteDevice.h"
+ #include "Core/NetPlayProto.h"
++#include "Core/RE4RNGSearch.h"
+ #include "Core/RE4RNGTrace.h"
+ #include "Core/State.h"
+ #include "Core/System.h"
+@@ -1138,6 +1139,7 @@ void MovieManager::PlayController(GCPadStatus* PadStatus, int controllerID)
+   }
  
--    const bool is_re4_rng = op.address == Core::RE4RNGTrace::RNG_FUNCTION_ADDRESS;
-+    // The v3 benchmark measures search throughput, not tracer overhead. The RNG-entry callback
-+    // requires GPR/FPR flushes on every RNG call, so disable it in this benchmark build.
-+    const bool is_re4_rng = false;
-     const bool is_re4_drop_probe = Core::RE4RNGTrace::IsDropProbeAddress(op.address);
-     if (is_re4_rng || is_re4_drop_probe)
-     {
-diff --git a/Source/Core/Core/RE4RNGBenchmark.cpp b/Source/Core/Core/RE4RNGBenchmark.cpp
+   memcpy(&m_pad_state, &m_temp_input[m_current_byte], sizeof(ControllerState));
++  Core::RE4RNGSearch::MutateMovieControllerState(m_current_frame, m_pad_state);
+   m_current_byte += sizeof(ControllerState);
+ 
+   PadStatus->isConnected = m_pad_state.is_connected;
+diff --git a/Source/Core/Core/RE4RNGSearch.cpp b/Source/Core/Core/RE4RNGSearch.cpp
 new file mode 100644
-index 0000000..5028a07
+index 0000000..bf4aab6
 --- /dev/null
-+++ b/Source/Core/Core/RE4RNGBenchmark.cpp
-@@ -0,0 +1,822 @@
++++ b/Source/Core/Core/RE4RNGSearch.cpp
+@@ -0,0 +1,698 @@
 +// Copyright 2026 Dolphin Emulator Project
 +// SPDX-License-Identifier: GPL-2.0-or-later
 +
-+#include "Core/RE4RNGBenchmark.h"
++#include "Core/RE4RNGSearch.h"
 +
 +#include <algorithm>
-+#include <array>
 +#include <atomic>
 +#include <chrono>
-+#include <cstdint>
++#include <deque>
 +#include <fstream>
-+#include <limits>
 +#include <mutex>
++#include <set>
 +#include <span>
 +#include <string>
 +#include <string_view>
++#include <tuple>
++#include <utility>
 +#include <vector>
 +
 +#include <fmt/format.h>
@@ -57,14 +93,25 @@ index 0000000..5028a07
 +#include "Core/Config/MainSettings.h"
 +#include "Core/HW/CPU.h"
 +#include "Core/HW/Memmap.h"
++#include "Core/Movie.h"
 +#include "Core/PowerPC/Gekko.h"
 +#include "Core/PowerPC/PowerPC.h"
++#include "Core/RE4RNGTrace.h"
 +#include "Core/State.h"
 +#include "Core/System.h"
-+#include "InputCommon/GCPadStatus.h"
 +#include "VideoCommon/OnScreenDisplay.h"
 +
-+namespace Core::RE4RNGBenchmark
++namespace Core::RE4RNGSearch
 +{
 +namespace
 +{
++constexpr u64 CAPTURE_FRAME = 2818;
++constexpr u64 WINDOW_FIRST = 2822;
++constexpr u64 WINDOW_LAST = 2910;
++constexpr u64 RESULT_FRAME = 2914;
++constexpr u64 HARD_END_FRAME = 2924;
++constexpr u64 BUDGET = 5000;
++constexpr u32 GATE_PC = 0x800D2794;
++constexpr u32 ROUTE_PC = 0x800D1E9C;
++constexpr u32 FINAL_ID_PC = 0x800D1EF0;
++constexpr u16 EXPECTED_BASELINE_GATE = 0x42B3;
