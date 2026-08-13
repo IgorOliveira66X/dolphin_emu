@@ -1,1 +1,4 @@
-hello world
++std::string InputVariant(const Mutation& mutation)
++{
++  return fmt::format("F{}:V{}", mutation.frame, static_cast<unsigned>(mutation.kind));
++}
