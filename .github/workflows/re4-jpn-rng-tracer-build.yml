@@ -1,4 +1,4 @@
-name: Build RE4 JPN RNG Tracer v2
+name: Build RE4 JPN RNG Benchmark v3
 
 on:
   workflow_dispatch:
@@ -22,9 +22,16 @@ jobs:
         with:
           ref: agent/re4-jpn-rng-tracer
           submodules: recursive
-          fetch-depth: 1
+          fetch-depth: 0
 
-      - name: Verify and apply RE4 JPN RNG tracer v2 patch
+      - name: Apply validated tracer v2 base
+        shell: pwsh
+        run: |
+          git show 526f9813faadfb1c80739348853b34597d2c9636:RE4_JPN_RNG_TRACER.patch | Set-Content -Encoding utf8NoBOM RE4_JPN_RNG_TRACER_V2_BASE.patch
+          git apply --check RE4_JPN_RNG_TRACER_V2_BASE.patch
+          git apply RE4_JPN_RNG_TRACER_V2_BASE.patch
+
+      - name: Apply in-memory benchmark v3 patch
         shell: pwsh
         run: |
           git apply --check RE4_JPN_RNG_TRACER.patch
@@ -42,10 +49,10 @@ jobs:
           if (-not $exe) { throw 'Dolphin.exe was not produced.' }
           Write-Host "Built executable: $($exe.FullName)"
 
-      - name: Upload portable Dolphin v2 build
+      - name: Upload portable Dolphin v3 benchmark build
         uses: actions/upload-artifact@v4
         with:
-          name: Dolphin-RE4-JPN-RNG-Tracer-v2-Windows-x64
+          name: Dolphin-RE4-JPN-RNG-Benchmark-v3-Windows-x64
           path: build/release/x64/Binaries/**
           if-no-files-found: error
           compression-level: 6
