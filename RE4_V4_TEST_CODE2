@@ -1,0 +1,2 @@
++std::atomic_bool s_suppress_trace_io{false};
++SearchState s_state;
