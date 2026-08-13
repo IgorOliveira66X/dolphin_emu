@@ -22,12 +22,13 @@ jobs:
         with:
           ref: agent/re4-jpn-rng-tracer
           submodules: recursive
-          fetch-depth: 0
+          fetch-depth: 1
 
       - name: Apply validated tracer v2 base
         shell: pwsh
         run: |
-          git show 526f9813faadfb1c80739348853b34597d2c9636:RE4_JPN_RNG_TRACER.patch | Set-Content -Encoding utf8NoBOM RE4_JPN_RNG_TRACER_V2_BASE.patch
+          git fetch --depth=1 origin 526f9813faadfb1c80739348853b34597d2c9636
+          git show FETCH_HEAD:RE4_JPN_RNG_TRACER.patch | Set-Content -Encoding utf8NoBOM RE4_JPN_RNG_TRACER_V2_BASE.patch
           git apply --check RE4_JPN_RNG_TRACER_V2_BASE.patch
           git apply RE4_JPN_RNG_TRACER_V2_BASE.patch
 
