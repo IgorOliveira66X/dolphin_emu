@@ -1,0 +1,90 @@
++constexpr u64 CAPTURE_FRAME = 2818;
++constexpr u64 MUTATION_FIRST_FRAME = 2822;
++constexpr u64 MUTATION_LAST_FRAME = 2910;
++constexpr u64 MUTATION_FRAME_STEP = 2;
++constexpr u64 ATTEMPT_END_FRAME = 2918;
++constexpr u64 MAX_ATTEMPTS = 5000;
++constexpr std::size_t MAX_SELECTED_SINGLES = 96;
++constexpr std::size_t MAX_REPRESENTATIVES_PER_SIGNATURE = 2;
++
++constexpr u32 DROP_GATE_PC = 0x800D2794;
++constexpr u32 GRENADE_ROLL_PC = 0x800D1E9C;
++constexpr u32 GRENADE_FINAL_ID_PC = 0x800D1EF0;
++constexpr u32 RNG_STATE_ADDRESS = 0x802B69BC;
++constexpr u32 TARGET_ITEM_ID = 1;
++
++constexpr std::string_view RESULT_FILENAME = "re4_jpn_rng_search.csv";
++constexpr std::string_view FOUND_FILENAME = "re4_jpn_rng_search_FOUND.txt";
++
++enum class MutationKind : u8
++{
++  BOff,
++  LOn,
++  ROn,
++  StickXMinus,
++  StickXPlus,
++  StickYMinus,
++  StickYPlus,
++};
++
++struct Mutation
++{
++  u64 frame = 0;
++  MutationKind kind = MutationKind::BOff;
++};
++
++struct AttemptPlan
++{
++  u64 attempt_id = 0;
++  u8 phase = 0;
++  std::array<Mutation, 3> mutations{};
++  u8 mutation_count = 0;
++};
++
++struct AttemptResult
++{
++  bool gate_seen = false;
++  u16 gate_seed = 0;
++  bool grenade_seen = false;
++  u16 grenade_seed = 0;
++  bool final_id_seen = false;
++  u32 final_id = 0;
++  bool target_found = false;
++};
++
++struct SingleOutcome
++{
++  Mutation mutation{};
++  AttemptResult result{};
++};
++
++struct SearchState
++{
++  bool armed = true;
++  bool capture_requested = false;
++  bool snapshot_ready = false;
++  bool restore_requested = false;
++  bool finished = false;
++  bool failed = false;
++  bool suppress_trace_io = false;
++  bool phase2_built = false;
++  bool phase3_built = false;
++
++  std::vector<u8> snapshot;
++  float previous_speed = 1.0f;
++  std::chrono::steady_clock::time_point start_time{};
++  std::chrono::nanoseconds restore_time{};
++  u64 restore_count = 0;
++
++  std::vector<Mutation> primitives;
++  std::vector<AttemptPlan> plans;
++  std::vector<SingleOutcome> singles;
++  std::vector<Mutation> selected_singles;
++  std::size_t current_plan_index = 0;
++  AttemptResult current_result{};
++  AttemptResult baseline_result{};
++  bool baseline_recorded = false;
++
++  std::ofstream result_log;
++};
++
