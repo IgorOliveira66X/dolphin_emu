@@ -1,4 +1,4 @@
-name: Build RE4 JPN RNG Benchmark v3
+name: Build RE4 JPN RNG Search v4
 
 on:
   workflow_dispatch:
@@ -31,11 +31,28 @@ jobs:
           git apply --check RE4_JPN_RNG_TRACER_V2_BASE.patch
           git apply RE4_JPN_RNG_TRACER_V2_BASE.patch
 
-      - name: Apply in-memory benchmark v3 patch
+      - name: Decode and verify internal RNG search v4 patch
         shell: pwsh
         run: |
-          git apply --check RE4_JPN_RNG_TRACER.patch
-          git apply RE4_JPN_RNG_TRACER.patch
+          $b64 = (Get-Content -Raw RE4_V4_PATCH_GZ_B64.txt).Trim()
+          [System.IO.File]::WriteAllBytes('RE4_JPN_RNG_SEARCH_V4.patch.gz', [Convert]::FromBase64String($b64))
+          $input = [System.IO.File]::OpenRead('RE4_JPN_RNG_SEARCH_V4.patch.gz')
+          $output = [System.IO.File]::Create('RE4_JPN_RNG_SEARCH_V4.patch')
+          $gzip = [System.IO.Compression.GZipStream]::new($input, [System.IO.Compression.CompressionMode]::Decompress)
+          try {
+            $gzip.CopyTo($output)
+          }
+          finally {
+            $gzip.Dispose()
+            $output.Dispose()
+            $input.Dispose()
+          }
+          $hash = (Get-FileHash RE4_JPN_RNG_SEARCH_V4.patch -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($hash -ne 'd35df73408f9433a09cfc86f855130bf8294e2f95e705b702bbff1eac5b4075e') {
+            throw "v4 patch SHA256 mismatch: $hash"
+          }
+          git apply --check RE4_JPN_RNG_SEARCH_V4.patch
+          git apply RE4_JPN_RNG_SEARCH_V4.patch
           git diff --check
 
       - name: Configure and build Release x64
@@ -49,10 +66,10 @@ jobs:
           if (-not $exe) { throw 'Dolphin.exe was not produced.' }
           Write-Host "Built executable: $($exe.FullName)"
 
-      - name: Upload portable Dolphin v3 benchmark build
+      - name: Upload portable Dolphin v4 search build
         uses: actions/upload-artifact@v4
         with:
-          name: Dolphin-RE4-JPN-RNG-Benchmark-v3-Windows-x64
+          name: Dolphin-RE4-JPN-RNG-Search-v4-Windows-x64
           path: build/release/x64/Binaries/**
           if-no-files-found: error
           compression-level: 6
