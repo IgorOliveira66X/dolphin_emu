@@ -1,572 +1,308 @@
-diff --git a/RE4_JPN_RNG_TRACER_README.txt b/RE4_JPN_RNG_TRACER_README.txt
-new file mode 100644
-index 0000000..43a1e94
---- /dev/null
-+++ b/RE4_JPN_RNG_TRACER_README.txt
-@@ -0,0 +1,56 @@
-+RE4 JPN RNG / Input / Drop Tracer v2 for Dolphin
-+=================================================
-+
-+Target
-+------
-+Game ID: G4BJ08 (Biohazard 4 JPN)
-+RNG function: 0x8014BDA0
-+Global 16-bit RNG state: 0x802B69BC
-+
-+Files produced
-+--------------
-+<Dolphin User Folder>/Logs/re4_jpn_rng_trace.csv
-+  External RNG callers only. call_index still counts every RNG entry, including
-+  internal calls, so RNG agenda offsets remain measurable without huge files.
-+
-+<Dolphin User Folder>/Logs/re4_jpn_pad_trace.csv
-+  One row for every controller-1 poll delivered to the game, even when no RNG
-+  call happens. This resolves timing ambiguities between nearby movie inputs.
-+
-+<Dolphin User Folder>/Logs/re4_jpn_drop_trace.csv
-+  Register snapshots at known RE4 JPN drop-related PCs. Each row contains:
-+  frame/input/poll, PC/label, seed, LR/CTR/CR/XER, controller state, and r0-r31.
-+
-+Drop probes
-+-----------
-+0x800D1978  drop path checkpoint
-+0x800D1B34  drop path checkpoint
-+0x800D1E9C  grenade type roll
-+0x800D1EF0  grenade final-ID checkpoint
-+0x800D224C  ammo/item path
-+0x800D23F8  quantity checkpoint
-+0x800D24B8  drop path checkpoint
-+0x800D2770  drop path checkpoint
-+0x800D2794  drop gate RNG call
-+0x800D2798  immediately after drop-gate RNG
-+0x800D27B0  drop path checkpoint
-+0x800D2B64  selected drop path
-+0x800D2BF0  ammo path checkpoint
-+0x800D2FC0  late drop RNG checkpoint
-+0x800D2FD0  late drop RNG call
-+0x800D2FE0  late result pre-checkpoint
-+0x800D2FE4  late result checkpoint
-+0x800D2FF8  final return checkpoint
-+
-+Notes
-+-----
-+The labels describe our current reverse-engineering checkpoints; the raw PPC
-+register dump is the source of truth. The first v2 tests with known outcomes
-+(incendiary grenade and 10 handgun ammo) can be used to identify which register
-+carries the final item ID and quantity at the labeled checkpoints.
-+
-+CPU cores
-+---------
-+- x86-64 JIT: supported (normal Windows x64 Dolphin path)
-+- Interpreter: supported
-+- Cached Interpreter / ARM64 JIT: not instrumented by this patch
 diff --git a/Source/Core/Core/CMakeLists.txt b/Source/Core/Core/CMakeLists.txt
-index 56c8dba..21a656a 100644
+index 21a656a..51a62f5 100644
 --- a/Source/Core/Core/CMakeLists.txt
 +++ b/Source/Core/Core/CMakeLists.txt
 @@ -500,6 +500,8 @@ add_library(core
    MemTools.h
    Movie.cpp
    Movie.h
-+  RE4RNGTrace.cpp
-+  RE4RNGTrace.h
++  RE4RNGBenchmark.cpp
++  RE4RNGBenchmark.h
+   RE4RNGTrace.cpp
+   RE4RNGTrace.h
    NetPlayClient.cpp
-   NetPlayClient.h
-   NetPlayCommon.cpp
-diff --git a/Source/Core/Core/Movie.cpp b/Source/Core/Core/Movie.cpp
-index 047fbfc..b760ef5 100644
---- a/Source/Core/Core/Movie.cpp
-+++ b/Source/Core/Core/Movie.cpp
-@@ -58,6 +58,7 @@
- #include "Core/IOS/USB/Bluetooth/BTEmu.h"
- #include "Core/IOS/USB/Bluetooth/WiimoteDevice.h"
- #include "Core/NetPlayProto.h"
-+#include "Core/RE4RNGTrace.h"
- #include "Core/State.h"
- #include "Core/System.h"
- #include "Core/WiiUtils.h"
-@@ -190,6 +191,8 @@ void MovieManager::FrameUpdate()
- // NOTE: EmuThread
- void MovieManager::Init(const BootParameters& boot)
- {
-+  Core::RE4RNGTrace::ResetSession();
-+
-   if (std::holds_alternative<BootParameters::Disc>(boot.parameters))
-     m_current_file_name = std::get<BootParameters::Disc>(boot.parameters).path;
-   else
-@@ -765,6 +768,9 @@ void MovieManager::CheckPadStatus(const GCPadStatus* PadStatus, int controllerID
-   m_pad_state.reset = m_reset;
-   m_reset = false;
- 
-+  Core::RE4RNGTrace::OnPadStatus(*PadStatus, controllerID, m_current_frame,
-+                                 m_current_input_count + 1);
-+
-   {
-     std::string display_str = GenerateInputDisplayString(m_pad_state, controllerID);
- 
-@@ -1197,6 +1203,9 @@ void MovieManager::PlayController(GCPadStatus* PadStatus, int controllerID)
-   if (m_pad_state.reset)
-     m_system.GetProcessorInterface().ResetButton_Tap();
- 
-+  Core::RE4RNGTrace::OnPadStatus(*PadStatus, controllerID, m_current_frame,
-+                                 m_current_input_count + 1);
-+
-   {
-     std::string display_str = GenerateInputDisplayString(m_pad_state, controllerID);
- 
-diff --git a/Source/Core/Core/PowerPC/Interpreter/Interpreter.cpp b/Source/Core/Core/PowerPC/Interpreter/Interpreter.cpp
-index 5ff6fa0..c856bcc 100644
---- a/Source/Core/Core/PowerPC/Interpreter/Interpreter.cpp
-+++ b/Source/Core/Core/PowerPC/Interpreter/Interpreter.cpp
-@@ -22,6 +22,7 @@
- #include "Core/PowerPC/MMU.h"
- #include "Core/PowerPC/PPCTables.h"
- #include "Core/PowerPC/PowerPC.h"
-+#include "Core/RE4RNGTrace.h"
- #include "Core/System.h"
- 
- namespace
-@@ -117,6 +118,11 @@ bool Interpreter::HandleFunctionHooking(u32 address)
- 
- int Interpreter::SingleStepInner()
- {
-+  if (m_ppc_state.pc == Core::RE4RNGTrace::RNG_FUNCTION_ADDRESS)
-+    Core::RE4RNGTrace::OnRNGFunctionEntry(&m_system);
-+  if (Core::RE4RNGTrace::IsDropProbeAddress(m_ppc_state.pc))
-+    Core::RE4RNGTrace::OnDropProbeEntry(&m_system, m_ppc_state.pc);
-+
-   if (HandleFunctionHooking(m_ppc_state.pc))
-   {
-     UpdatePC();
-diff --git a/Source/Core/Core/PowerPC/Jit64/Jit.cpp b/Source/Core/Core/PowerPC/Jit64/Jit.cpp
-index 1248b1a..408bf5b 100644
---- a/Source/Core/Core/PowerPC/Jit64/Jit.cpp
-+++ b/Source/Core/Core/PowerPC/Jit64/Jit.cpp
-@@ -45,6 +45,7 @@
- #include "Core/PowerPC/JitInterface.h"
- #include "Core/PowerPC/MMU.h"
- #include "Core/PowerPC/PPCAnalyst.h"
-+#include "Core/RE4RNGTrace.h"
- #include "Core/PowerPC/PowerPC.h"
- #include "Core/System.h"
- 
-@@ -1067,6 +1068,21 @@ bool Jit64::DoJit(u32 em_address, JitBlock* b, u32 nextPC)
-     if (HandleFunctionHooking(op.address))
-       break;
- 
-+    const bool is_re4_rng = op.address == Core::RE4RNGTrace::RNG_FUNCTION_ADDRESS;
-+    const bool is_re4_drop_probe = Core::RE4RNGTrace::IsDropProbeAddress(op.address);
-+    if (is_re4_rng || is_re4_drop_probe)
-+    {
-+      gpr.Flush();
-+      fpr.Flush();
-+
-+      ABI_PushRegistersAndAdjustStack({}, 0);
-+      if (is_re4_rng)
-+        ABI_CallFunctionP(Core::RE4RNGTrace::OnRNGFunctionEntry, &m_system);
-+      if (is_re4_drop_probe)
-+        ABI_CallFunctionPC(Core::RE4RNGTrace::OnDropProbeEntry, &m_system, op.address);
-+      ABI_PopRegistersAndAdjustStack({}, 0);
-+    }
-+
-     if (op.skip)
-     {
-       if (IsBranchWatchEnabled())
-diff --git a/Source/Core/Core/RE4RNGTrace.cpp b/Source/Core/Core/RE4RNGTrace.cpp
+diff --git a/Source/Core/Core/RE4RNGBenchmark.cpp b/Source/Core/Core/RE4RNGBenchmark.cpp
 new file mode 100644
-index 0000000..5a7f868
+index 0000000..7657ab5
 --- /dev/null
-+++ b/Source/Core/Core/RE4RNGTrace.cpp
-@@ -0,0 +1,383 @@
++++ b/Source/Core/Core/RE4RNGBenchmark.cpp
+@@ -0,0 +1,280 @@
 +// Copyright 2026 Dolphin Emulator Project
 +// SPDX-License-Identifier: GPL-2.0-or-later
 +
-+#include "Core/RE4RNGTrace.h"
++#include "Core/RE4RNGBenchmark.h"
 +
-+#include <array>
++#include <atomic>
++#include <chrono>
 +#include <fstream>
 +#include <mutex>
++#include <span>
 +#include <string>
 +#include <string_view>
-+#include <utility>
++#include <vector>
 +
 +#include <fmt/format.h>
 +
++#include "Common/Config/Config.h"
 +#include "Common/FileUtil.h"
-+#include "Core/ConfigManager.h"
-+#include "Core/HW/Memmap.h"
-+#include "Core/PowerPC/Gekko.h"
-+#include "Core/PowerPC/PowerPC.h"
++#include "Core/Config/MainSettings.h"
++#include "Core/HW/CPU.h"
++#include "Core/State.h"
 +#include "Core/System.h"
-+#include "InputCommon/GCPadStatus.h"
 +#include "VideoCommon/OnScreenDisplay.h"
 +
-+namespace Core::RE4RNGTrace
++namespace Core::RE4RNGBenchmark
 +{
 +namespace
 +{
-+constexpr std::string_view TARGET_GAME_ID = "G4BJ08";
-+constexpr std::string_view RNG_TRACE_FILENAME = "re4_jpn_rng_trace.csv";
-+constexpr std::string_view PAD_TRACE_FILENAME = "re4_jpn_pad_trace.csv";
-+constexpr std::string_view DROP_TRACE_FILENAME = "re4_jpn_drop_trace.csv";
++constexpr u64 CAPTURE_FRAME = 2858;
++constexpr u32 TARGET_PC = 0x800D2794;
++constexpr u64 MIN_ITERATIONS = 100;
++constexpr u64 MAX_ITERATIONS = 10000;
++constexpr auto MIN_WALL_TIME = std::chrono::seconds(10);
++constexpr std::string_view RESULT_FILENAME = "re4_jpn_rng_benchmark.csv";
 +
-+struct InputSnapshot
++struct BenchmarkState
 +{
-+  u16 buttons = 0;
-+  u8 stick_x = GCPadStatus::MAIN_STICK_CENTER_X;
-+  u8 stick_y = GCPadStatus::MAIN_STICK_CENTER_Y;
-+  u8 cstick_x = GCPadStatus::C_STICK_CENTER_X;
-+  u8 cstick_y = GCPadStatus::C_STICK_CENTER_Y;
-+  u8 trigger_l = 0;
-+  u8 trigger_r = 0;
-+  u8 analog_a = 0;
-+  u8 analog_b = 0;
-+  bool connected = false;
-+};
-+
-+struct TraceState
-+{
-+  bool active = false;
-+  u64 frame = 0;
-+  u64 input_count = 0;
-+  u64 poll_index = 0;
-+  u64 total_calls = 0;
-+  u64 external_calls = 0;
-+  u64 calls_this_poll = 0;
-+  u64 calls_previous_poll = 0;
-+  u64 drop_probe_index = 0;
-+  u32 last_caller = 0;
-+  u16 last_seed_before = 0;
-+  u16 last_seed_after = 0;
-+  u8 last_rng_byte = 0;
-+  InputSnapshot input{};
-+  std::ofstream rng_log;
-+  std::ofstream pad_log;
-+  std::ofstream drop_log;
++  bool armed = true;
++  bool capture_requested = false;
++  bool snapshot_ready = false;
++  bool restore_requested = false;
++  bool finished = false;
++  bool suppress_trace_io = false;
++  bool failed = false;
++  u64 iterations = 0;
++  u64 restore_count = 0;
++  std::vector<u8> snapshot;
++  float previous_speed = 1.0f;
++  std::chrono::steady_clock::time_point start_time{};
++  std::chrono::nanoseconds restore_time{};
 +};
 +
 +std::mutex s_mutex;
-+TraceState s_state;
++std::atomic_bool s_suppress_trace_io{false};
++BenchmarkState s_state;
 +
-+bool IsTargetGame()
-+{
-+  return SConfig::GetInstance().GetGameID() == TARGET_GAME_ID;
-+}
-+
-+bool IsInternalRNGCaller(u32 caller)
-+{
-+  // Calls made from inside the RNG routine itself dominate the v1 log and are not useful for
-+  // input-to-callsite comparisons. We still count them in total_calls; we simply do not emit rows.
-+  return caller >= 0x8014BDA0 && caller <= 0x8014BE60;
-+}
-+
-+std::pair<u16, u8> NextRNG(u16 old_seed)
-+{
-+  const u16 shifted = static_cast<u16>(old_seed >> 1);
-+  const u8 low = static_cast<u8>(shifted & 0xFF);
-+  const u8 high = static_cast<u8>((shifted + (old_seed >> 8)) & 0xFF);
-+
-+  u16 next = static_cast<u16>((static_cast<u16>(high) << 8) | low);
-+  if (next == old_seed)
-+    next = static_cast<u16>(next + 0x0101);
-+
-+  return {next, static_cast<u8>(next >> 8)};
-+}
-+
-+std::string_view DropProbeLabel(u32 pc)
-+{
-+  switch (pc)
-+  {
-+  case 0x800D1978:
-+    return "drop_path_1978";
-+  case 0x800D1B34:
-+    return "drop_path_1B34";
-+  case 0x800D1E9C:
-+    return "grenade_type_roll";
-+  case 0x800D1EF0:
-+    return "grenade_final_id_checkpoint";
-+  case 0x800D224C:
-+    return "ammo_item_path";
-+  case 0x800D23F8:
-+    return "quantity_checkpoint";
-+  case 0x800D24B8:
-+    return "drop_path_24B8";
-+  case 0x800D2770:
-+    return "drop_path_2770";
-+  case 0x800D2794:
-+    return "drop_gate_rng_call";
-+  case 0x800D2798:
-+    return "drop_gate_after_rng";
-+  case 0x800D27B0:
-+    return "drop_path_27B0";
-+  case 0x800D2B64:
-+    return "drop_selected_path";
-+  case 0x800D2BF0:
-+    return "ammo_path_checkpoint";
-+  case 0x800D2FC0:
-+    return "late_drop_rng_checkpoint";
-+  case 0x800D2FD0:
-+    return "late_drop_rng_call";
-+  case 0x800D2FE0:
-+    return "late_drop_result_pre";
-+  case 0x800D2FE4:
-+    return "late_drop_result";
-+  case 0x800D2FF8:
-+    return "drop_final_return";
-+  default:
-+    return "unknown";
-+  }
-+}
-+
-+void OpenTraceFiles()
++void WriteResultLocked(double total_seconds)
 +{
 +  File::CreateFullPath(File::GetUserPath(D_LOGS_IDX));
-+  const std::string logs_path = File::GetUserPath(D_LOGS_IDX);
-+
-+  s_state.rng_log =
-+      std::ofstream(logs_path + std::string(RNG_TRACE_FILENAME), std::ios::out | std::ios::trunc);
-+  s_state.pad_log =
-+      std::ofstream(logs_path + std::string(PAD_TRACE_FILENAME), std::ios::out | std::ios::trunc);
-+  s_state.drop_log =
-+      std::ofstream(logs_path + std::string(DROP_TRACE_FILENAME), std::ios::out | std::ios::trunc);
-+
-+  if (s_state.rng_log)
-+  {
-+    s_state.rng_log
-+        << "call_index,external_index,frame,input_count,poll_index,call_in_poll,caller,lr,"
-+           "seed_before,seed_after,rng_byte,buttons,stick_x,stick_y,cstick_x,cstick_y,"
-+           "trigger_l,trigger_r,analog_a,analog_b,connected\n";
-+    s_state.rng_log.flush();
-+  }
-+
-+  if (s_state.pad_log)
-+  {
-+    s_state.pad_log
-+        << "poll_index,frame,input_count,rng_calls_previous_poll,buttons,stick_x,stick_y,"
-+           "cstick_x,cstick_y,trigger_l,trigger_r,analog_a,analog_b,connected\n";
-+    s_state.pad_log.flush();
-+  }
-+
-+  if (s_state.drop_log)
-+  {
-+    s_state.drop_log
-+        << "probe_index,frame,input_count,poll_index,pc,label,seed,lr,ctr,cr,xer,"
-+           "buttons,stick_x,stick_y,cstick_x,cstick_y,trigger_l,trigger_r,analog_a,analog_b,"
-+           "r0,r1,r2,r3,r4,r5,r6,r7,r8,r9,r10,r11,r12,r13,r14,r15,r16,r17,r18,r19,"
-+           "r20,r21,r22,r23,r24,r25,r26,r27,r28,r29,r30,r31\n";
-+    s_state.drop_log.flush();
-+  }
-+}
-+
-+void EnsureActive()
-+{
-+  if (s_state.active)
++  const std::string path = File::GetUserPath(D_LOGS_IDX) + std::string(RESULT_FILENAME);
++  std::ofstream out(path, std::ios::out | std::ios::trunc);
++  if (!out)
 +    return;
 +
-+  s_state.active = true;
-+  OpenTraceFiles();
++  const double total_ms = total_seconds * 1000.0;
++  const double restore_ms = std::chrono::duration<double, std::milli>(s_state.restore_time).count();
++  const double attempts_per_sec =
++      total_seconds > 0.0 ? static_cast<double>(s_state.iterations) / total_seconds : 0.0;
++  const double avg_cycle_us = s_state.iterations > 0 ?
++                                  total_seconds * 1'000'000.0 /
++                                      static_cast<double>(s_state.iterations) :
++                                  0.0;
++  const double avg_restore_us = s_state.restore_count > 0 ?
++                                    restore_ms * 1000.0 /
++                                        static_cast<double>(s_state.restore_count) :
++                                    0.0;
++  const double avg_sim_us = s_state.iterations > 0 ?
++                                ((total_ms - restore_ms) * 1000.0) /
++                                    static_cast<double>(s_state.iterations) :
++                                0.0;
++
++  out << "capture_frame,target_pc,iterations,restore_count,snapshot_bytes,total_ms,restore_ms,"
++         "attempts_per_sec,avg_cycle_us,avg_restore_us,avg_sim_us,failed\n";
++  out << fmt::format("{},${:08X},{},{},{},{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{}\n",
++                     CAPTURE_FRAME, TARGET_PC, s_state.iterations, s_state.restore_count,
++                     s_state.snapshot.size(), total_ms, restore_ms, attempts_per_sec, avg_cycle_us,
++                     avg_restore_us, avg_sim_us, s_state.failed ? 1 : 0);
++  out.flush();
 +}
 +
-+void UpdateHUD()
++void CaptureOnCPUThread(System* system)
 +{
-+  if (!s_state.active)
-+    return;
++  auto snapshot = State::SaveToMemory(*system);
++  const bool ok = !snapshot.empty();
 +
-+  const std::string text = fmt::format(
-+      "RE4 RNG v2 | F:{} Poll:{} PrevCalls:{} Total:{} Ext:{}\n"
-+      "Caller:${:08X} Seed:${:04X}->${:04X} Byte:${:02X} Btn:${:04X} "
-+      "LS:{:02X},{:02X} CS:{:02X},{:02X}",
-+      s_state.frame, s_state.poll_index, s_state.calls_previous_poll, s_state.total_calls,
-+      s_state.external_calls, s_state.last_caller, s_state.last_seed_before,
-+      s_state.last_seed_after, s_state.last_rng_byte, s_state.input.buttons,
-+      s_state.input.stick_x, s_state.input.stick_y, s_state.input.cstick_x,
-+      s_state.input.cstick_y);
++  {
++    std::lock_guard lock{s_mutex};
++    if (!ok)
++    {
++      s_state.failed = true;
++      s_state.finished = true;
++      OSD::AddTypedMessage(OSD::MessageType::RE4RNGTrace,
++                           "RE4 RNG benchmark v3 FAILED: in-memory snapshot error",
++                           OSD::Duration::VERY_LONG, OSD::Color::RED);
++      return;
++    }
 +
-+  OSD::AddTypedMessage(OSD::MessageType::RE4RNGTrace, text, OSD::Duration::VERY_LONG,
-+                       OSD::Color::CYAN);
++    s_state.snapshot = std::move(snapshot);
++    s_state.snapshot_ready = true;
++    s_state.restore_requested = false;
++    s_state.suppress_trace_io = true;
++    s_suppress_trace_io.store(true, std::memory_order_release);
++    s_state.iterations = 0;
++    s_state.restore_count = 0;
++    s_state.restore_time = std::chrono::nanoseconds::zero();
++    s_state.previous_speed = Config::Get(Config::MAIN_EMULATION_SPEED);
++    Config::SetCurrent(Config::MAIN_EMULATION_SPEED, 0.0f);
++    s_state.start_time = std::chrono::steady_clock::now();
++
++    OSD::AddTypedMessage(
++        OSD::MessageType::RE4RNGTrace,
++        fmt::format("RE4 RNG BENCH v3 START | F{} -> ${:08X} | snapshot {:.1f} MiB | unlimited",
++                    CAPTURE_FRAME, TARGET_PC,
++                    static_cast<double>(s_state.snapshot.size()) / (1024.0 * 1024.0)),
++        OSD::Duration::VERY_LONG, OSD::Color::GREEN);
++  }
++
++  system->GetCPU().Continue();
++}
++
++void RestoreOnCPUThread(System* system)
++{
++  std::span<u8> snapshot;
++  {
++    std::lock_guard lock{s_mutex};
++    if (!s_state.snapshot.empty())
++      snapshot = s_state.snapshot;
++  }
++
++  const auto start = std::chrono::steady_clock::now();
++  const bool ok = !snapshot.empty() && State::LoadFromMemory(*system, snapshot);
++  const auto end = std::chrono::steady_clock::now();
++
++  {
++    std::lock_guard lock{s_mutex};
++    s_state.restore_time += std::chrono::duration_cast<std::chrono::nanoseconds>(end - start);
++    ++s_state.restore_count;
++    s_state.restore_requested = false;
++
++    if (!ok)
++    {
++      s_state.failed = true;
++      s_state.finished = true;
++      s_state.suppress_trace_io = false;
++      s_suppress_trace_io.store(false, std::memory_order_release);
++      Config::SetCurrent(Config::MAIN_EMULATION_SPEED, s_state.previous_speed);
++      const auto elapsed = std::chrono::steady_clock::now() - s_state.start_time;
++      WriteResultLocked(std::chrono::duration<double>(elapsed).count());
++      OSD::AddTypedMessage(OSD::MessageType::RE4RNGTrace,
++                           "RE4 RNG benchmark v3 FAILED: in-memory restore error",
++                           OSD::Duration::VERY_LONG, OSD::Color::RED);
++      return;
++    }
++  }
++
++  system->GetCPU().Continue();
 +}
 +}  // namespace
-+
-+bool IsDropProbeAddress(u32 pc)
-+{
-+  switch (pc)
-+  {
-+  case 0x800D1978:
-+  case 0x800D1B34:
-+  case 0x800D1E9C:
-+  case 0x800D1EF0:
-+  case 0x800D224C:
-+  case 0x800D23F8:
-+  case 0x800D24B8:
-+  case 0x800D2770:
-+  case 0x800D2794:
-+  case 0x800D2798:
-+  case 0x800D27B0:
-+  case 0x800D2B64:
-+  case 0x800D2BF0:
-+  case 0x800D2FC0:
-+  case 0x800D2FD0:
-+  case 0x800D2FE0:
-+  case 0x800D2FE4:
-+  case 0x800D2FF8:
-+    return true;
-+  default:
-+    return false;
-+  }
-+}
 +
 +void ResetSession()
 +{
 +  std::lock_guard lock{s_mutex};
++  s_state = BenchmarkState{};
++  s_suppress_trace_io.store(false, std::memory_order_release);
 +
-+  if (s_state.rng_log.is_open())
-+    s_state.rng_log.close();
-+  if (s_state.pad_log.is_open())
-+    s_state.pad_log.close();
-+  if (s_state.drop_log.is_open())
-+    s_state.drop_log.close();
-+
-+  s_state = TraceState{};
-+  s_state.active = IsTargetGame();
-+  if (!s_state.active)
-+    return;
-+
-+  OpenTraceFiles();
 +  OSD::AddTypedMessage(
 +      OSD::MessageType::RE4RNGTrace,
-+      fmt::format("RE4 JPN RNG tracer v2 armed | RNG ${:08X} | seed ${:08X} | drop probes ON",
-+                  RNG_FUNCTION_ADDRESS, RNG_STATE_ADDRESS),
++      fmt::format("RE4 RNG benchmark v3 armed | capture F{} | target ${:08X}", CAPTURE_FRAME,
++                  TARGET_PC),
 +      OSD::Duration::VERY_LONG, OSD::Color::GREEN);
 +}
 +
-+void OnPadStatus(const GCPadStatus& pad_status, int controller_id, u64 frame, u64 input_count)
++void OnPadPoll(u64 frame)
 +{
-+  if (controller_id != 0 || !IsTargetGame())
-+    return;
-+
-+  std::lock_guard lock{s_mutex};
-+  EnsureActive();
-+
-+  s_state.calls_previous_poll = s_state.calls_this_poll;
-+  s_state.calls_this_poll = 0;
-+  s_state.frame = frame;
-+  s_state.input_count = input_count;
-+  ++s_state.poll_index;
-+
-+  s_state.input.buttons = pad_status.button;
-+  s_state.input.stick_x = pad_status.stickX;
-+  s_state.input.stick_y = pad_status.stickY;
-+  s_state.input.cstick_x = pad_status.substickX;
-+  s_state.input.cstick_y = pad_status.substickY;
-+  s_state.input.trigger_l = pad_status.triggerLeft;
-+  s_state.input.trigger_r = pad_status.triggerRight;
-+  s_state.input.analog_a = pad_status.analogA;
-+  s_state.input.analog_b = pad_status.analogB;
-+  s_state.input.connected = pad_status.isConnected;
-+
-+  if (s_state.pad_log)
++  bool request_capture = false;
 +  {
-+    s_state.pad_log << fmt::format(
-+        "{},{},{},{},${:04X},{},{},{},{},{},{},{},{},{}\n", s_state.poll_index,
-+        s_state.frame, s_state.input_count, s_state.calls_previous_poll, s_state.input.buttons,
-+        s_state.input.stick_x, s_state.input.stick_y, s_state.input.cstick_x,
-+        s_state.input.cstick_y, s_state.input.trigger_l, s_state.input.trigger_r,
-+        s_state.input.analog_a, s_state.input.analog_b, s_state.input.connected ? 1 : 0);
-+
-+    if ((s_state.poll_index & 0x3F) == 0)
-+      s_state.pad_log.flush();
++    std::lock_guard lock{s_mutex};
++    if (s_state.armed && !s_state.capture_requested && !s_state.snapshot_ready &&
++        !s_state.finished && frame >= CAPTURE_FRAME)
++    {
++      s_state.capture_requested = true;
++      request_capture = true;
++    }
 +  }
 +
-+  UpdateHUD();
++  if (!request_capture)
++    return;
++
++  System* const system = &System::GetInstance();
++  system->GetCPU().AddCPUThreadJob([system] { CaptureOnCPUThread(system); });
++  system->GetCPU().Break();
 +}
 +
-+void OnRNGFunctionEntry(System* system)
++bool OnDropProbe(System* system, u32 pc)
 +{
-+  if (system == nullptr || !IsTargetGame())
-+    return;
++  if (system == nullptr || pc != TARGET_PC)
++    return false;
 +
-+  const auto& ppc_state = system->GetPowerPC().GetPPCState();
-+  const u32 lr = ppc_state.spr[SPR_LR];
-+  const u32 caller = lr >= 4 ? lr - 4 : 0;
-+  const u16 seed_before = system->GetMemory().Read_U16(RNG_STATE_ADDRESS);
-+  const auto [seed_after, rng_byte] = NextRNG(seed_before);
++  bool should_restore = false;
++  bool should_finish = false;
++  double total_seconds = 0.0;
++  u64 iterations = 0;
++  double attempts_per_sec = 0.0;
++  double avg_restore_us = 0.0;
 +
-+  std::lock_guard lock{s_mutex};
-+  EnsureActive();
-+
-+  ++s_state.total_calls;
-+  ++s_state.calls_this_poll;
-+  s_state.last_caller = caller;
-+  s_state.last_seed_before = seed_before;
-+  s_state.last_seed_after = seed_after;
-+  s_state.last_rng_byte = rng_byte;
-+
-+  if (IsInternalRNGCaller(caller))
-+    return;
-+
-+  ++s_state.external_calls;
-+  if (s_state.rng_log)
 +  {
-+    s_state.rng_log << fmt::format(
-+        "{},{},{},{},{},{},${:08X},${:08X},${:04X},${:04X},${:02X},${:04X},"
-+        "{},{},{},{},{},{},{},{},{}\n",
-+        s_state.total_calls, s_state.external_calls, s_state.frame, s_state.input_count,
-+        s_state.poll_index, s_state.calls_this_poll, caller, lr, seed_before, seed_after, rng_byte,
-+        s_state.input.buttons, s_state.input.stick_x, s_state.input.stick_y,
-+        s_state.input.cstick_x, s_state.input.cstick_y, s_state.input.trigger_l,
-+        s_state.input.trigger_r, s_state.input.analog_a, s_state.input.analog_b,
-+        s_state.input.connected ? 1 : 0);
++    std::lock_guard lock{s_mutex};
++    if (!s_state.snapshot_ready || s_state.finished || s_state.restore_requested)
++      return false;
 +
-+    if ((s_state.external_calls & 0x3F) == 0)
-+      s_state.rng_log.flush();
++    ++s_state.iterations;
++    const auto elapsed = std::chrono::steady_clock::now() - s_state.start_time;
++    total_seconds = std::chrono::duration<double>(elapsed).count();
++
++    const bool time_limit =
++        s_state.iterations >= MIN_ITERATIONS && elapsed >= MIN_WALL_TIME;
++    const bool iteration_limit = s_state.iterations >= MAX_ITERATIONS;
++
++    if (time_limit || iteration_limit)
++    {
++      s_state.finished = true;
++      s_state.suppress_trace_io = false;
++      s_suppress_trace_io.store(false, std::memory_order_release);
++      Config::SetCurrent(Config::MAIN_EMULATION_SPEED, s_state.previous_speed);
++      WriteResultLocked(total_seconds);
++
++      iterations = s_state.iterations;
++      attempts_per_sec =
++          total_seconds > 0.0 ? static_cast<double>(iterations) / total_seconds : 0.0;
++      const double restore_ms =
++          std::chrono::duration<double, std::milli>(s_state.restore_time).count();
++      avg_restore_us = s_state.restore_count > 0 ?
++                           restore_ms * 1000.0 / static_cast<double>(s_state.restore_count) :
++                           0.0;
++      should_finish = true;
++    }
++    else
++    {
++      s_state.restore_requested = true;
++      should_restore = true;
++    }
 +  }
++
++  if (should_finish)
++  {
++    OSD::AddTypedMessage(
++        OSD::MessageType::RE4RNGTrace,
++        fmt::format("RE4 RNG BENCH DONE | {} attempts | {:.2f}/s | restore {:.1f} us",
++                    iterations, attempts_per_sec, avg_restore_us),
++        OSD::Duration::VERY_LONG, OSD::Color::GREEN);
++    system->GetCPU().Break();
++    return true;
++  }
++
++  if (should_restore)
++  {
++    system->GetCPU().AddCPUThreadJob([system] { RestoreOnCPUThread(system); });
++    system->GetCPU().Break();
++    return true;
++  }
++
++  return false;
 +}
 +
-+void OnDropProbeEntry(System* system, u32 pc)
++bool IsSuppressingTraceIO()
 +{
-+  if (system == nullptr || !IsTargetGame() || !IsDropProbeAddress(pc))
-+    return;
-+
-+  const auto& ppc_state = system->GetPowerPC().GetPPCState();
-+  const u16 seed = system->GetMemory().Read_U16(RNG_STATE_ADDRESS);
-+  const u32 lr = ppc_state.spr[SPR_LR];
-+  const u32 ctr = ppc_state.spr[SPR_CTR];
-+  const u32 cr = ppc_state.cr.Get();
-+  const u32 xer = ppc_state.GetXER().Hex;
-+
-+  std::lock_guard lock{s_mutex};
-+  EnsureActive();
-+  ++s_state.drop_probe_index;
-+
-+  if (!s_state.drop_log)
-+    return;
-+
-+  s_state.drop_log << fmt::format(
-+      "{},{},{},{},${:08X},{},${:04X},${:08X},${:08X},${:08X},${:08X},"
-+      "${:04X},{},{},{},{},{},{},{},{},",
-+      s_state.drop_probe_index, s_state.frame, s_state.input_count, s_state.poll_index, pc,
-+      DropProbeLabel(pc), seed, lr, ctr, cr, xer, s_state.input.buttons, s_state.input.stick_x,
-+      s_state.input.stick_y, s_state.input.cstick_x, s_state.input.cstick_y,
-+      s_state.input.trigger_l, s_state.input.trigger_r, s_state.input.analog_a,
-+      s_state.input.analog_b);
-+
-+  for (size_t i = 0; i < std::size(ppc_state.gpr); ++i)
-+  {
-+    if (i != 0)
-+      s_state.drop_log << ',';
-+    s_state.drop_log << fmt::format("${:08X}", ppc_state.gpr[i]);
-+  }
-+  s_state.drop_log << '\n';
-+  s_state.drop_log.flush();
++  return s_suppress_trace_io.load(std::memory_order_acquire);
 +}
 +
-+}  // namespace Core::RE4RNGTrace
-diff --git a/Source/Core/Core/RE4RNGTrace.h b/Source/Core/Core/RE4RNGTrace.h
++}  // namespace Core::RE4RNGBenchmark
+diff --git a/Source/Core/Core/RE4RNGBenchmark.h b/Source/Core/Core/RE4RNGBenchmark.h
 new file mode 100644
-index 0000000..d2ecef3
+index 0000000..66ec4c9
 --- /dev/null
-+++ b/Source/Core/Core/RE4RNGTrace.h
-@@ -0,0 +1,36 @@
++++ b/Source/Core/Core/RE4RNGBenchmark.h
+@@ -0,0 +1,28 @@
 +// Copyright 2026 Dolphin Emulator Project
 +// SPDX-License-Identifier: GPL-2.0-or-later
 +
@@ -574,44 +310,146 @@ index 0000000..d2ecef3
 +
 +#include "Common/CommonTypes.h"
 +
-+struct GCPadStatus;
-+
 +namespace Core
 +{
 +class System;
 +
-+namespace RE4RNGTrace
++namespace RE4RNGBenchmark
 +{
-+constexpr u32 RNG_FUNCTION_ADDRESS = 0x8014BDA0;
-+constexpr u32 RNG_STATE_ADDRESS = 0x802B69BC;
-+
-+// Starts a fresh trace when Biohazard 4 JPN (G4BJ08) boots.
-+// For other games this is a no-op.
++// Resets the special first-Ganado benchmark state for a new G4BJ08 session.
 +void ResetSession();
 +
-+// Captures every GameCube controller poll delivered to controller 1.
-+void OnPadStatus(const GCPadStatus& pad_status, int controller_id, u64 frame, u64 input_count);
++// Called after controller 1 is delivered to the movie/game. The benchmark captures once the
++// current movie reaches its configured pre-drop frame.
++void OnPadPoll(u64 frame);
 +
-+// Called at the entry of $8014BDA0 on the emulated CPU thread.
-+void OnRNGFunctionEntry(System* system);
++// Called before executing a known drop-probe PC. Returns true when the benchmark consumed the
++// event (target hit / restore / finish), so the normal drop logger can skip that probe.
++bool OnDropProbe(System* system, u32 pc);
 +
-+// True for RE4 JPN drop-related PCs instrumented by the tracer.
-+bool IsDropProbeAddress(u32 pc);
-+
-+// Called before executing a drop-related instruction. Dumps PPC register state.
-+void OnDropProbeEntry(System* system, u32 pc);
-+
-+}  // namespace RE4RNGTrace
++// Trace files are intentionally suppressed while the hot benchmark loop is running.
++bool IsSuppressingTraceIO();
++}  // namespace RE4RNGBenchmark
 +}  // namespace Core
-diff --git a/Source/Core/VideoCommon/OnScreenDisplay.h b/Source/Core/VideoCommon/OnScreenDisplay.h
-index 2819de5..7f7bdfe 100644
---- a/Source/Core/VideoCommon/OnScreenDisplay.h
-+++ b/Source/Core/VideoCommon/OnScreenDisplay.h
-@@ -18,6 +18,7 @@ enum class MessageType
- {
-   NetPlayPing,
-   NetPlayBuffer,
-+  RE4RNGTrace,
+diff --git a/Source/Core/Core/RE4RNGTrace.cpp b/Source/Core/Core/RE4RNGTrace.cpp
+index 5a7f868..77e79af 100644
+--- a/Source/Core/Core/RE4RNGTrace.cpp
++++ b/Source/Core/Core/RE4RNGTrace.cpp
+@@ -14,6 +14,7 @@
  
-   // This entry must be kept last so that persistent typed messages are
-   // displayed before other messages
+ #include "Common/FileUtil.h"
+ #include "Core/ConfigManager.h"
++#include "Core/RE4RNGBenchmark.h"
+ #include "Core/HW/Memmap.h"
+ #include "Core/PowerPC/Gekko.h"
+ #include "Core/PowerPC/PowerPC.h"
+@@ -252,6 +253,7 @@ void ResetSession()
+     return;
+ 
+   OpenTraceFiles();
++  Core::RE4RNGBenchmark::ResetSession();
+   OSD::AddTypedMessage(
+       OSD::MessageType::RE4RNGTrace,
+       fmt::format("RE4 JPN RNG tracer v2 armed | RNG ${:08X} | seed ${:08X} | drop probes ON",
+@@ -284,7 +286,7 @@ void OnPadStatus(const GCPadStatus& pad_status, int controller_id, u64 frame, u6
+   s_state.input.analog_b = pad_status.analogB;
+   s_state.input.connected = pad_status.isConnected;
+ 
+-  if (s_state.pad_log)
++  if (!Core::RE4RNGBenchmark::IsSuppressingTraceIO() && s_state.pad_log)
+   {
+     s_state.pad_log << fmt::format(
+         "{},{},{},{},${:04X},{},{},{},{},{},{},{},{},{}\n", s_state.poll_index,
+@@ -298,6 +300,7 @@ void OnPadStatus(const GCPadStatus& pad_status, int controller_id, u64 frame, u6
+   }
+ 
+   UpdateHUD();
++  Core::RE4RNGBenchmark::OnPadPoll(frame);
+ }
+ 
+ void OnRNGFunctionEntry(System* system)
+@@ -325,7 +328,7 @@ void OnRNGFunctionEntry(System* system)
+     return;
+ 
+   ++s_state.external_calls;
+-  if (s_state.rng_log)
++  if (!Core::RE4RNGBenchmark::IsSuppressingTraceIO() && s_state.rng_log)
+   {
+     s_state.rng_log << fmt::format(
+         "{},{},{},{},{},{},${:08X},${:08X},${:04X},${:04X},${:02X},${:04X},"
+@@ -347,6 +350,9 @@ void OnDropProbeEntry(System* system, u32 pc)
+   if (system == nullptr || !IsTargetGame() || !IsDropProbeAddress(pc))
+     return;
+ 
++  if (Core::RE4RNGBenchmark::OnDropProbe(system, pc))
++    return;
++
+   const auto& ppc_state = system->GetPowerPC().GetPPCState();
+   const u16 seed = system->GetMemory().Read_U16(RNG_STATE_ADDRESS);
+   const u32 lr = ppc_state.spr[SPR_LR];
+@@ -358,7 +364,7 @@ void OnDropProbeEntry(System* system, u32 pc)
+   EnsureActive();
+   ++s_state.drop_probe_index;
+ 
+-  if (!s_state.drop_log)
++  if (Core::RE4RNGBenchmark::IsSuppressingTraceIO() || !s_state.drop_log)
+     return;
+ 
+   s_state.drop_log << fmt::format(
+diff --git a/Source/Core/Core/State.cpp b/Source/Core/Core/State.cpp
+index 2dcd2ca..7819cca 100644
+--- a/Source/Core/Core/State.cpp
++++ b/Source/Core/Core/State.cpp
+@@ -258,6 +258,26 @@ static std::size_t SaveToBuffer(Core::System& system, Common::UniqueBuffer<u8>&
+   return 0;
+ }
+ 
++std::vector<u8> SaveToMemory(Core::System& system)
++{
++  const auto buffer_size_estimate = static_cast<std::size_t>(s_last_state_size) * 110 / 100;
++  Common::UniqueBuffer<u8> buffer{buffer_size_estimate};
++  const std::size_t actual_size = SaveToBuffer(system, buffer);
++  if (actual_size == 0)
++    return {};
++
++  std::vector<u8> result(actual_size);
++  std::copy_n(buffer.data(), actual_size, result.data());
++  return result;
++}
++
++bool LoadFromMemory(Core::System& system, std::span<u8> buffer)
++{
++  if (buffer.empty())
++    return false;
++  return LoadFromBuffer(system, buffer);
++}
++
+ namespace
+ {
+ struct SlotWithTimestamp
+diff --git a/Source/Core/Core/State.h b/Source/Core/Core/State.h
+index cd35ea1..a91e601 100644
+--- a/Source/Core/Core/State.h
++++ b/Source/Core/Core/State.h
+@@ -7,8 +7,10 @@
+ 
+ #include <cstddef>
+ #include <functional>
++#include <span>
+ #include <string>
+ #include <type_traits>
++#include <vector>
+ 
+ #include "Common/CommonTypes.h"
+ 
+@@ -98,6 +100,10 @@ void Load(Core::System& system, u32 slot);
+ void SaveAs(Core::System& system, std::string filename);
+ void LoadAs(Core::System& system, std::string filename);
+ 
++// Fast, uncompressed in-memory savestates for deterministic tooling.
++std::vector<u8> SaveToMemory(Core::System& system);
++bool LoadFromMemory(Core::System& system, std::span<u8> buffer);
++
+ void LoadLastSaved(Core::System& system, int i = 1);
+ void SaveFirstSaved(Core::System& system);
+ void UndoSaveState(Core::System& system);
