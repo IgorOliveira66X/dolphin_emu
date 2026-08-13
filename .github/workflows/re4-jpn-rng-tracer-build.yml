@@ -49,7 +49,7 @@ jobs:
             $input.Dispose()
           }
           $hash = (Get-FileHash RE4_JPN_RNG_SEARCH_V4.patch -Algorithm SHA256).Hash.ToLowerInvariant()
-          if ($hash -ne 'd35df73408f9433a09cfc86f855130bf8294e2f95e705b702bbff1eac5b4075e') {
+          if ($hash -ne 'e90be28827ecfa0ec41adefbddf58db36b31dfda61a49545d5f260a52bdf952e') {
             throw "v4 patch SHA256 mismatch: $hash"
           }
           git apply --check RE4_JPN_RNG_SEARCH_V4.patch
