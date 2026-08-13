@@ -63,7 +63,7 @@ index b760ef5..f33b9bd 100644
    PadStatus->isConnected = m_pad_state.is_connected;
 diff --git a/Source/Core/Core/RE4RNGSearch.cpp b/Source/Core/Core/RE4RNGSearch.cpp
 new file mode 100644
-index 0000000..bf4aab6
+index 0000000..8793c8e
 --- /dev/null
 +++ b/Source/Core/Core/RE4RNGSearch.cpp
 @@ -0,0 +1,698 @@
@@ -92,26 +92,4 @@ index 0000000..bf4aab6
 +#include "Common/FileUtil.h"
 +#include "Core/Config/MainSettings.h"
 +#include "Core/HW/CPU.h"
-+#include "Core/HW/Memmap.h"
-+#include "Core/Movie.h"
-+#include "Core/PowerPC/Gekko.h"
-+#include "Core/PowerPC/PowerPC.h"
-+#include "Core/RE4RNGTrace.h"
-+#include "Core/State.h"
-+#include "Core/System.h"
-+#include "VideoCommon/OnScreenDisplay.h"
-+
-+namespace Core::RE4RNGSearch
-+{
-+namespace
-+{
-+constexpr u64 CAPTURE_FRAME = 2818;
-+constexpr u64 WINDOW_FIRST = 2822;
-+constexpr u64 WINDOW_LAST = 2910;
-+constexpr u64 RESULT_FRAME = 2914;
-+constexpr u64 HARD_END_FRAME = 2924;
-+constexpr u64 BUDGET = 5000;
-+constexpr u32 GATE_PC = 0x800D2794;
-+constexpr u32 ROUTE_PC = 0x800D1E9C;
-+constexpr u32 FINAL_ID_PC = 0x800D1EF0;
-+constexpr u16 EXPECTED_BASELINE_GATE = 0x42B3;
++#inc
