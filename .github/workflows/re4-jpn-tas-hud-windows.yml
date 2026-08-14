@@ -1,0 +1,58 @@
+name: RE4 JPN TAS HUD v1 Windows Build
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - agent/re4-jpn-tas-hud
+    paths:
+      - Source/Core/Core/RE4TASHUD.cpp
+      - Source/Core/Core/RE4TASHUD.h
+      - Source/Core/Core/CMakeLists.txt
+      - Source/Core/Core/Movie.cpp
+      - Source/Core/VideoCommon/OnScreenDisplay.h
+      - RE4_JPN_TAS_HUD_V1_README.txt
+      - .github/workflows/re4-jpn-tas-hud-windows.yml
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: windows-2025-vs2026
+    timeout-minutes: 120
+
+    steps:
+      - name: Checkout Dolphin with submodules
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 1
+
+      - name: Verify source tree
+        shell: pwsh
+        run: git diff --check
+
+      - name: Configure and build Release x64
+        shell: pwsh
+        run: cmake --workflow --preset visualstudio-release-x64
+
+      - name: Verify Dolphin executable
+        shell: pwsh
+        run: |
+          $exe = Get-ChildItem -Path build/release/x64/Binaries -Filter Dolphin.exe -Recurse | Select-Object -First 1
+          if (-not $exe) { throw 'Dolphin.exe was not produced.' }
+          Write-Host "Built executable: $($exe.FullName)"
+
+      - name: Include HUD documentation
+        shell: pwsh
+        run: Copy-Item RE4_JPN_TAS_HUD_V1_README.txt build/release/x64/Binaries/
+
+      - name: Upload portable Dolphin build
+        uses: actions/upload-artifact@v4
+        with:
+          name: Dolphin-RE4-JPN-TAS-HUD-v1-Windows-x64
+          path: build/release/x64/Binaries/**
+          if-no-files-found: error
+          compression-level: 6
+          retention-days: 30
