@@ -1,4 +1,4 @@
-name: RE4 JPN Generic Drop Search v7 Windows Build
+name: RE4 JPN Generic Drop Search v7.1 Windows Build
 
 on:
   workflow_dispatch:
@@ -51,7 +51,7 @@ jobs:
       - name: Upload portable Dolphin build
         uses: actions/upload-artifact@v4
         with:
-          name: Dolphin-RE4-JPN-Generic-Drop-Search-v7-Windows-x64
+          name: Dolphin-RE4-JPN-Generic-Drop-Search-v7.1-Windows-x64
           path: build/release/x64/Binaries/**
           if-no-files-found: error
           compression-level: 6

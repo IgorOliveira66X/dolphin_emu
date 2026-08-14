@@ -1,12 +1,16 @@
-RE4 JPN GENERIC DROP SEARCH v7
-================================
+RE4 JPN GENERIC DROP SEARCH v7.1
+==================================
 
 WHAT CHANGED
 ------------
-v7 is one configurable search engine instead of a patch tied to one drop scene. It supports
+v7.1 is one configurable search engine instead of a patch tied to one drop scene. It supports
 1 through 10 simultaneous drops, order-independent or per-slot targets, calibrated controller
 mutations, separate grenade/money/target corpora, adaptive-difficulty logging, and automatic
 generation of the winning DTM.
+
+v7.1 fixes the initial v7 profile failing silently because a semicolon comment containing '='
+was interpreted as a Catalog entry. The loader now ignores semicolon comments in Catalog, the
+bundled INI uses Dolphin-compatible '#' comments, and search status has its own HUD line.
 
 CURRENT BUNDLED PROFILE
 -----------------------

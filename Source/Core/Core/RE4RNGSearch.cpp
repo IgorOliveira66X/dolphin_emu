@@ -560,6 +560,9 @@ bool LoadConfig(SearchConfig* config, std::string* path, std::string* error)
   {
     for (const auto& [name, value] : catalog->GetValues())
     {
+      const std::string trimmed_name = Trim(name);
+      if (trimmed_name.starts_with(';') || trimmed_name.starts_with('#'))
+        continue;
       const std::optional<u64> parsed = ParseU64(value);
       if (!parsed || *parsed > std::numeric_limits<u32>::max())
       {
@@ -1235,7 +1238,7 @@ void WriteFoundLocked(bool dtm_written)
     return;
   out.imbue(std::locale::classic());
   out << "RE4 JPN GENERIC DROP TARGET FOUND\n";
-  out << "Searcher: v7 generic profile engine\n";
+  out << "Searcher: v7.1 generic profile engine\n";
   out << fmt::format("Profile: {}\n", s_state.config.profile);
   out << fmt::format("Target mode: {}\n", TargetModeName(s_state.config.target_mode));
   out << fmt::format("Target: {}\n", TargetDescription());
@@ -1272,7 +1275,7 @@ void WriteSummaryLocked(std::string_view status)
   if (!out)
     return;
   out.imbue(std::locale::classic());
-  out << "RE4 JPN GENERIC DROP SEARCH v7 SUMMARY\n";
+  out << "RE4 JPN GENERIC DROP SEARCH v7.1 SUMMARY\n";
   out << fmt::format("Status: {}\n", status);
   out << fmt::format("Profile: {}\n", s_state.config.profile);
   out << fmt::format("Config: {}\n", s_state.config_path);
@@ -1719,8 +1722,8 @@ void FinishCalibrationLocked()
   }
   s_state.calibration_done = true;
   OSD::AddTypedMessage(
-      OSD::MessageType::RE4RNGTrace,
-      fmt::format("RE4 v7 calibration DONE | {} kinds | {} active slots",
+      OSD::MessageType::RE4DropSearch,
+      fmt::format("RE4 v7.1 calibration DONE | {} kinds | {} active slots",
                   s_state.effective_kinds.size(), s_state.effective_slots.size()),
       OSD::Duration::VERY_LONG, OSD::Color::GREEN);
 }
@@ -1784,8 +1787,8 @@ bool PrepareNextPlanLocked()
       return false;
     s_state.validation_done = true;
     OSD::AddTypedMessage(
-        OSD::MessageType::RE4RNGTrace,
-        fmt::format("RE4 v7 validation PASSED | {} drops | window {}-{}",
+        OSD::MessageType::RE4DropSearch,
+        fmt::format("RE4 v7.1 validation PASSED | {} drops | window {}-{}",
                     s_state.validation_outcomes[0].completed_count,
                     s_state.config.window_first, s_state.effective_window_last),
         OSD::Duration::VERY_LONG, OSD::Color::GREEN);
@@ -1818,7 +1821,7 @@ void FinishSearchLocked(System* system, std::string_view message, u32 color)
   if (s_state.results)
     s_state.results.flush();
   WriteSummaryLocked(message);
-  OSD::AddTypedMessage(OSD::MessageType::RE4RNGTrace, std::string(message),
+  OSD::AddTypedMessage(OSD::MessageType::RE4DropSearch, std::string(message),
                        OSD::Duration::VERY_LONG, color);
   if (system)
     system->GetCPU().Break();
@@ -1845,7 +1848,7 @@ void CaptureOnCPUThread(System* system)
           "wrong DTM (got {} frames / {} inputs; expected {} / {})", movie.GetTotalFrames(),
           movie.GetTotalInputCount(), s_state.config.expected_movie_frames,
           s_state.config.expected_movie_inputs);
-      FinishSearchLocked(system, "RE4 v7 FAILED: DTM does not match the active profile",
+      FinishSearchLocked(system, "RE4 v7.1 FAILED: DTM does not match the active profile",
                          OSD::Color::RED);
       return;
     }
@@ -1856,7 +1859,7 @@ void CaptureOnCPUThread(System* system)
     std::lock_guard lock{s_mutex};
     if (snapshot.empty())
     {
-      FinishSearchLocked(system, "RE4 v7 FAILED: in-memory snapshot error", OSD::Color::RED);
+      FinishSearchLocked(system, "RE4 v7.1 FAILED: in-memory snapshot error", OSD::Color::RED);
       return;
     }
     s_state.snapshot = std::move(snapshot);
@@ -1870,13 +1873,13 @@ void CaptureOnCPUThread(System* system)
     s_state.search_start = std::chrono::steady_clock::now();
     if (!PrepareNextPlanLocked())
     {
-      FinishSearchLocked(system, "RE4 v7 FAILED: could not prepare validation",
+      FinishSearchLocked(system, "RE4 v7.1 FAILED: could not prepare validation",
                          OSD::Color::RED);
       return;
     }
     OSD::AddTypedMessage(
-        OSD::MessageType::RE4RNGTrace,
-        fmt::format("RE4 DROP SEARCH v7 START | {} | F{} | budget {}", s_state.config.profile,
+        OSD::MessageType::RE4DropSearch,
+        fmt::format("RE4 DROP SEARCH v7.1 START | {} | F{} | budget {}", s_state.config.profile,
                     s_state.config.capture_frame, s_state.config.budget),
         OSD::Duration::VERY_LONG, OSD::Color::GREEN);
   }
@@ -1896,7 +1899,7 @@ void RestoreOnCPUThread(System* system)
     s_state.restore_requested = false;
     if (!restored)
     {
-      FinishSearchLocked(system, "RE4 v7 FAILED: in-memory restore error", OSD::Color::RED);
+      FinishSearchLocked(system, "RE4 v7.1 FAILED: in-memory restore error", OSD::Color::RED);
       return;
     }
     if (!PrepareNextPlanLocked())
@@ -1904,7 +1907,7 @@ void RestoreOnCPUThread(System* system)
       if (!s_state.validation_done)
       {
         FinishSearchLocked(system,
-                           fmt::format("RE4 v7 validation FAILED | {}",
+                           fmt::format("RE4 v7.1 validation FAILED | {}",
                                        s_state.validation_error),
                            OSD::Color::RED);
       }
@@ -1912,7 +1915,7 @@ void RestoreOnCPUThread(System* system)
       {
         FinishSearchLocked(
             system,
-            fmt::format("RE4 v7 DONE | {} attempts | {} signatures", s_state.attempts,
+            fmt::format("RE4 v7.1 DONE | {} attempts | {} signatures", s_state.attempts,
                         s_state.seen_signatures.size()),
             OSD::Color::YELLOW);
       }
@@ -1981,15 +1984,15 @@ void CompleteAttempt(System* system, std::string status)
 
     if (new_grenade_route && s_state.route_corpus.size() <= 20)
     {
-      OSD::AddTypedMessage(OSD::MessageType::RE4RNGTrace,
-                           fmt::format("RE4 v7 GRENADE ROUTE | attempt {} | parents {}", attempts,
+      OSD::AddTypedMessage(OSD::MessageType::RE4DropSearch,
+                           fmt::format("RE4 v7.1 GRENADE ROUTE | attempt {} | parents {}", attempts,
                                        s_state.route_corpus.size()),
                            OSD::Duration::VERY_LONG, OSD::Color::GREEN);
     }
     else if (new_money_route && s_state.money_corpus.size() <= 20)
     {
-      OSD::AddTypedMessage(OSD::MessageType::RE4RNGTrace,
-                           fmt::format("RE4 v7 MONEY ROUTE | attempt {} | parents {}", attempts,
+      OSD::AddTypedMessage(OSD::MessageType::RE4DropSearch,
+                           fmt::format("RE4 v7.1 MONEY ROUTE | attempt {} | parents {}", attempts,
                                        s_state.money_corpus.size()),
                            OSD::Duration::VERY_LONG, OSD::Color::CYAN);
     }
@@ -1997,8 +2000,8 @@ void CompleteAttempt(System* system, std::string status)
     if ((attempts % 100) == 0)
     {
       OSD::AddTypedMessage(
-          OSD::MessageType::RE4RNGTrace,
-          fmt::format("RE4 v7 | {} | {:.2f}/s | phase {} | cost {}/{} | corpus {} | G {} | P {}",
+          OSD::MessageType::RE4DropSearch,
+          fmt::format("RE4 v7.1 | {} | {:.2f}/s | phase {} | cost {}/{} | corpus {} | G {} | P {}",
                       attempts, rate, s_state.current_plan.phase,
                       s_state.current_plan.movement_cost_frames,
                       s_state.config.max_movement_cost_frames, s_state.corpus.size(),
@@ -2011,7 +2014,7 @@ void CompleteAttempt(System* system, std::string status)
   {
     std::lock_guard lock{s_mutex};
     FinishSearchLocked(system,
-                       fmt::format("RE4 v7 TARGET FOUND | attempt {} | DTM {} | {}", attempts,
+                       fmt::format("RE4 v7.1 TARGET FOUND | attempt {} | DTM {} | {}", attempts,
                                    dtm_written ? "OK" : "ERROR", found_plan),
                        OSD::Color::GREEN);
     return;
@@ -2058,20 +2061,20 @@ void ResetSession()
   s_state.target_corpora.resize(s_state.config.targets.size());
   if (!loaded)
   {
-    OSD::AddTypedMessage(OSD::MessageType::RE4RNGTrace,
-                         fmt::format("RE4 v7 CONFIG ERROR | {}", s_state.config_error),
+    OSD::AddTypedMessage(OSD::MessageType::RE4DropSearch,
+                         fmt::format("RE4 v7.1 CONFIG ERROR | {}", s_state.config_error),
                          OSD::Duration::VERY_LONG, OSD::Color::RED);
     return;
   }
   if (!s_state.config.enabled)
   {
-    OSD::AddTypedMessage(OSD::MessageType::RE4RNGTrace, "RE4 drop search v7 disabled in INI",
+    OSD::AddTypedMessage(OSD::MessageType::RE4DropSearch, "RE4 drop search v7.1 disabled in INI",
                          OSD::Duration::NORMAL, OSD::Color::YELLOW);
     return;
   }
   OSD::AddTypedMessage(
-      OSD::MessageType::RE4RNGTrace,
-      fmt::format("RE4 drop search v7 armed | {} | {} drops | target {}",
+      OSD::MessageType::RE4DropSearch,
+      fmt::format("RE4 drop search v7.1 armed | {} | {} drops | target {}",
                   s_state.config.profile, s_state.config.expected_drops, TargetDescription()),
       OSD::Duration::VERY_LONG, OSD::Color::GREEN);
 }
