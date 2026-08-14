@@ -1,4 +1,4 @@
-name: RE4 JPN RNG Tracer Windows Build
+name: RE4 JPN RNG Search v5 Windows Build
 
 on:
   workflow_dispatch:
@@ -6,7 +6,7 @@ on:
     branches:
       - agent/re4-jpn-rng-tracer
     paths:
-      - RE4_JPN_RNG_TRACER.patch
+      - RE4_JPN_RNG_SEARCH_V5.patch
       - .github/workflows/re4-jpn-rng-tracer-windows.yml
 
 permissions:
@@ -24,11 +24,11 @@ jobs:
           submodules: recursive
           fetch-depth: 1
 
-      - name: Verify and apply RE4 JPN RNG tracer patch
+      - name: Verify and apply RE4 JPN RNG search v5 patch
         shell: pwsh
         run: |
-          git apply --check RE4_JPN_RNG_TRACER.patch
-          git apply RE4_JPN_RNG_TRACER.patch
+          git apply --check RE4_JPN_RNG_SEARCH_V5.patch
+          git apply RE4_JPN_RNG_SEARCH_V5.patch
           git diff --check
 
       - name: Configure and build Release x64
@@ -45,7 +45,7 @@ jobs:
       - name: Upload portable Dolphin build
         uses: actions/upload-artifact@v4
         with:
-          name: Dolphin-RE4-JPN-RNG-Tracer-Windows-x64
+          name: Dolphin-RE4-JPN-RNG-Search-v5-Windows-x64
           path: build/release/x64/Binaries/**
           if-no-files-found: error
           compression-level: 6
