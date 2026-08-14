@@ -1,0 +1,2047 @@
+diff --git a/Source/Core/Core/CMakeLists.txt b/Source/Core/Core/CMakeLists.txt
+index 56c8dba..cce0cbe 100644
+--- a/Source/Core/Core/CMakeLists.txt
++++ b/Source/Core/Core/CMakeLists.txt
+@@ -500,6 +500,10 @@ add_library(core
+   MemTools.h
+   Movie.cpp
+   Movie.h
++  RE4RNGSearch.cpp
++  RE4RNGSearch.h
++  RE4RNGTrace.cpp
++  RE4RNGTrace.h
+   NetPlayClient.cpp
+   NetPlayClient.h
+   NetPlayCommon.cpp
+diff --git a/Source/Core/Core/Movie.cpp b/Source/Core/Core/Movie.cpp
+index 047fbfc..f33b9bd 100644
+--- a/Source/Core/Core/Movie.cpp
++++ b/Source/Core/Core/Movie.cpp
+@@ -58,6 +58,8 @@
+ #include "Core/IOS/USB/Bluetooth/BTEmu.h"
+ #include "Core/IOS/USB/Bluetooth/WiimoteDevice.h"
+ #include "Core/NetPlayProto.h"
++#include "Core/RE4RNGSearch.h"
++#include "Core/RE4RNGTrace.h"
+ #include "Core/State.h"
+ #include "Core/System.h"
+ #include "Core/WiiUtils.h"
+@@ -190,6 +192,8 @@ void MovieManager::FrameUpdate()
+ // NOTE: EmuThread
+ void MovieManager::Init(const BootParameters& boot)
+ {
++  Core::RE4RNGTrace::ResetSession();
++
+   if (std::holds_alternative<BootParameters::Disc>(boot.parameters))
+     m_current_file_name = std::get<BootParameters::Disc>(boot.parameters).path;
+   else
+@@ -765,6 +769,9 @@ void MovieManager::CheckPadStatus(const GCPadStatus* PadStatus, int controllerID
+   m_pad_state.reset = m_reset;
+   m_reset = false;
+ 
++  Core::RE4RNGTrace::OnPadStatus(*PadStatus, controllerID, m_current_frame,
++                                 m_current_input_count + 1);
++
+   {
+     std::string display_str = GenerateInputDisplayString(m_pad_state, controllerID);
+ 
+@@ -1132,6 +1139,7 @@ void MovieManager::PlayController(GCPadStatus* PadStatus, int controllerID)
+   }
+ 
+   memcpy(&m_pad_state, &m_temp_input[m_current_byte], sizeof(ControllerState));
++  Core::RE4RNGSearch::MutateMovieControllerState(m_current_frame, m_pad_state);
+   m_current_byte += sizeof(ControllerState);
+ 
+   PadStatus->isConnected = m_pad_state.is_connected;
+@@ -1197,6 +1205,9 @@ void MovieManager::PlayController(GCPadStatus* PadStatus, int controllerID)
+   if (m_pad_state.reset)
+     m_system.GetProcessorInterface().ResetButton_Tap();
+ 
++  Core::RE4RNGTrace::OnPadStatus(*PadStatus, controllerID, m_current_frame,
++                                 m_current_input_count + 1);
++
+   {
+     std::string display_str = GenerateInputDisplayString(m_pad_state, controllerID);
+ 
+diff --git a/Source/Core/Core/PowerPC/Interpreter/Interpreter.cpp b/Source/Core/Core/PowerPC/Interpreter/Interpreter.cpp
+index 5ff6fa0..c856bcc 100644
+--- a/Source/Core/Core/PowerPC/Interpreter/Interpreter.cpp
++++ b/Source/Core/Core/PowerPC/Interpreter/Interpreter.cpp
+@@ -22,6 +22,7 @@
+ #include "Core/PowerPC/MMU.h"
+ #include "Core/PowerPC/PPCTables.h"
+ #include "Core/PowerPC/PowerPC.h"
++#include "Core/RE4RNGTrace.h"
+ #include "Core/System.h"
+ 
+ namespace
+@@ -117,6 +118,11 @@ bool Interpreter::HandleFunctionHooking(u32 address)
+ 
+ int Interpreter::SingleStepInner()
+ {
++  if (m_ppc_state.pc == Core::RE4RNGTrace::RNG_FUNCTION_ADDRESS)
++    Core::RE4RNGTrace::OnRNGFunctionEntry(&m_system);
++  if (Core::RE4RNGTrace::IsDropProbeAddress(m_ppc_state.pc))
++    Core::RE4RNGTrace::OnDropProbeEntry(&m_system, m_ppc_state.pc);
++
+   if (HandleFunctionHooking(m_ppc_state.pc))
+   {
+     UpdatePC();
+diff --git a/Source/Core/Core/PowerPC/Jit64/Jit.cpp b/Source/Core/Core/PowerPC/Jit64/Jit.cpp
+index 1248b1a..408bf5b 100644
+--- a/Source/Core/Core/PowerPC/Jit64/Jit.cpp
++++ b/Source/Core/Core/PowerPC/Jit64/Jit.cpp
+@@ -45,6 +45,7 @@
+ #include "Core/PowerPC/JitInterface.h"
+ #include "Core/PowerPC/MMU.h"
+ #include "Core/PowerPC/PPCAnalyst.h"
++#include "Core/RE4RNGTrace.h"
+ #include "Core/PowerPC/PowerPC.h"
+ #include "Core/System.h"
+ 
+@@ -1067,6 +1068,21 @@ bool Jit64::DoJit(u32 em_address, JitBlock* b, u32 nextPC)
+     if (HandleFunctionHooking(op.address))
+       break;
+ 
++    const bool is_re4_rng = op.address == Core::RE4RNGTrace::RNG_FUNCTION_ADDRESS;
++    const bool is_re4_drop_probe = Core::RE4RNGTrace::IsDropProbeAddress(op.address);
++    if (is_re4_rng || is_re4_drop_probe)
++    {
++      gpr.Flush();
++      fpr.Flush();
++
++      ABI_PushRegistersAndAdjustStack({}, 0);
++      if (is_re4_rng)
++        ABI_CallFunctionP(Core::RE4RNGTrace::OnRNGFunctionEntry, &m_system);
++      if (is_re4_drop_probe)
++        ABI_CallFunctionPC(Core::RE4RNGTrace::OnDropProbeEntry, &m_system, op.address);
++      ABI_PopRegistersAndAdjustStack({}, 0);
++    }
++
+     if (op.skip)
+     {
+       if (IsBranchWatchEnabled())
+diff --git a/Source/Core/Core/RE4RNGSearch.cpp b/Source/Core/Core/RE4RNGSearch.cpp
+new file mode 100644
+index 0000000..3116619
+--- /dev/null
++++ b/Source/Core/Core/RE4RNGSearch.cpp
+@@ -0,0 +1,1373 @@
++// Copyright 2026 Dolphin Emulator Project
++// SPDX-License-Identifier: GPL-2.0-or-later
++
++#include "Core/RE4RNGSearch.h"
++
++#include <algorithm>
++#include <array>
++#include <atomic>
++#include <chrono>
++#include <cstdlib>
++#include <deque>
++#include <fstream>
++#include <iterator>
++#include <mutex>
++#include <set>
++#include <span>
++#include <string>
++#include <string_view>
++#include <tuple>
++#include <unordered_set>
++#include <utility>
++#include <vector>
++
++#include <fmt/format.h>
++
++#include "Common/Config/Config.h"
++#include "Common/FileUtil.h"
++#include "Core/Config/MainSettings.h"
++#include "Core/HW/CPU.h"
++#include "Core/HW/Memmap.h"
++#include "Core/Movie.h"
++#include "Core/PowerPC/Gekko.h"
++#include "Core/PowerPC/PowerPC.h"
++#include "Core/RE4RNGTrace.h"
++#include "Core/State.h"
++#include "Core/System.h"
++#include "VideoCommon/OnScreenDisplay.h"
++
++namespace Core::RE4RNGSearch
++{
++namespace
++{
++// Exact neutral movie supplied for the village double-drop search.
++constexpr u64 EXPECTED_MOVIE_FRAMES = 8089;
++constexpr u64 EXPECTED_MOVIE_INPUTS = 16173;
++constexpr u64 CAPTURE_FRAME = 7823;
++constexpr u16 WINDOW_FIRST = 7826;  // Covers emulated frames 7825 and 7826.
++constexpr u16 WINDOW_MAX = 8032;    // The neutral movie presses A beginning at frame 8033.
++constexpr u64 WALKING_LAST_FRAME = 7953;
++constexpr u64 HARD_END_FRAME = 8070;
++constexpr u64 BUDGET = 200000;
++
++constexpr u32 GATE_PC = 0x800D2794;
++constexpr u32 ROUTE_PC = 0x800D1E9C;
++constexpr u32 GRENADE_FINAL_ID_PC = 0x800D1EF0;
++constexpr u32 LATE_DROP_RESULT_PC = 0x800D2FE4;
++constexpr u32 DROP_FINAL_RETURN_PC = 0x800D2FF8;
++constexpr u32 HAND_GRENADE_ID = 1;
++constexpr u32 PTAS_ITEM_ID = 0x78;
++constexpr u32 TARGET_PTAS_UNITS = 990;  // The game stores ptas drops in units of ten.
++
++constexpr u8 MAX_HOLD_SLOTS = 6;
++constexpr size_t MAX_PLAN_MUTATIONS = 12;
++constexpr u32 MAX_MOVEMENT_COST_FRAMES = 4;
++constexpr size_t MAX_CORPUS_ENTRIES = 8192;
++constexpr size_t MAX_PARTIAL_ENTRIES = 4096;
++constexpr u64 FUZZ_SEED = 0x5245345F44524F50ULL;
++
++constexpr std::string_view RESULTS_FILENAME = "re4_jpn_village_dual_drop_results.csv";
++constexpr std::string_view FOUND_FILENAME = "re4_jpn_village_dual_drop_FOUND.txt";
++constexpr std::string_view SUMMARY_FILENAME = "re4_jpn_village_dual_drop_summary.txt";
++
++enum class MutationKind : u8
++{
++  BOff,
++  LOn,
++  ROn,
++  StickXDelta,
++  StickYDelta,
++  StickYCenter,
++  CStickXDelta,
++  CStickYDelta,
++};
++
++struct Mutation
++{
++  u16 slot = WINDOW_FIRST;
++  u8 duration = 1;
++  MutationKind kind = MutationKind::BOff;
++  int amount = 0;
++};
++
++struct Plan
++{
++  int phase = 0;
++  std::vector<Mutation> mutations;
++  std::string label;
++  std::string parent_label = "ROOT";
++  u32 movement_cost_frames = 0;
++};
++
++struct DropEvent
++{
++  bool gate_seen = false;
++  u64 gate_frame = 0;
++  u16 gate_seed = 0;
++  bool route_seen = false;
++  u16 route_seed = 0;
++  bool grenade_seen = false;
++  u32 grenade_id = 0xFFFFFFFF;
++  bool late_result_seen = false;
++  u32 late_r31 = 0xFFFFFFFF;
++  u32 late_r29 = 0xFFFFFFFF;
++  bool final_return_seen = false;
++  bool complete = false;
++};
++
++struct Outcome
++{
++  std::array<DropEvent, 2> events{};
++  int active_event = -1;
++  size_t gate_count = 0;
++  size_t completed_count = 0;
++  bool overflow = false;
++  bool has_hand = false;
++  bool has_9900 = false;
++  bool target = false;
++  bool novel_signature = false;
++  std::string status = "ok";
++};
++
++struct CorpusEntry
++{
++  Plan plan{};
++  Outcome outcome{};
++};
++
++using SignatureKey = std::array<u64, 12>;
++
++struct SearchState
++{
++  bool armed = true;
++  bool capture_requested = false;
++  bool snapshot_ready = false;
++  bool restore_requested = false;
++  bool active = false;
++  bool finished = false;
++  bool found = false;
++  bool validation_done = false;
++  bool calibration_built = false;
++  bool adaptive_started = false;
++  u64 attempts = 0;
++  u64 partial_hand_attempts = 0;
++  u64 partial_9900_attempts = 0;
++  u64 rng_state = FUZZ_SEED;
++  u16 effective_window_last = WINDOW_MAX;
++  std::vector<u8> snapshot;
++  std::deque<Plan> queue;
++  Plan current_plan{};
++  Outcome current_outcome{};
++  std::vector<Outcome> validation_outcomes;
++  std::vector<CorpusEntry> corpus;
++  std::vector<CorpusEntry> hand_corpus;
++  std::vector<CorpusEntry> money_corpus;
++  std::set<SignatureKey> seen_signatures;
++  std::set<u16> seen_gate_seeds;
++  std::set<u16> seen_route_seeds;
++  std::set<u32> seen_grenade_ids;
++  std::set<u32> seen_money_units;
++  std::unordered_set<std::string> known_plan_labels;
++  float previous_speed = 1.0f;
++  std::string validation_error;
++  std::chrono::steady_clock::time_point search_start{};
++  std::chrono::steady_clock::time_point attempt_start{};
++  std::ofstream results;
++};
++
++std::mutex s_mutex;
++std::atomic_bool s_suppress_trace{false};
++SearchState s_state;
++
++bool IsHand(const DropEvent& event)
++{
++  return event.grenade_seen && event.grenade_id == HAND_GRENADE_ID;
++}
++
++bool IsMoney(const DropEvent& event)
++{
++  return event.late_result_seen && event.late_r31 == PTAS_ITEM_ID;
++}
++
++bool Is9900(const DropEvent& event)
++{
++  return IsMoney(event) && event.late_r29 == TARGET_PTAS_UNITS;
++}
++
++std::string EventClass(const DropEvent& event)
++{
++  if (IsHand(event))
++    return "HAND";
++  if (Is9900(event))
++    return "9900_PTAS";
++  if (IsMoney(event))
++    return fmt::format("{}_PTAS", static_cast<u64>(event.late_r29) * 10);
++  if (event.grenade_seen)
++    return fmt::format("GRENADE_ID_{:X}", event.grenade_id);
++  if (event.late_result_seen)
++    return fmt::format("ITEM_{:X}_VALUE_{:X}", event.late_r31, event.late_r29);
++  return "UNKNOWN";
++}
++
++void UpdateTarget(Outcome& outcome)
++{
++  outcome.has_hand = IsHand(outcome.events[0]) || IsHand(outcome.events[1]);
++  outcome.has_9900 = Is9900(outcome.events[0]) || Is9900(outcome.events[1]);
++  outcome.target = (IsHand(outcome.events[0]) && Is9900(outcome.events[1])) ||
++                   (Is9900(outcome.events[0]) && IsHand(outcome.events[1]));
++}
++
++std::string KindName(const Mutation& mutation)
++{
++  switch (mutation.kind)
++  {
++  case MutationKind::BOff:
++    return "B_OFF";
++  case MutationKind::LOn:
++    return "L";
++  case MutationKind::ROn:
++    return "R";
++  case MutationKind::StickXDelta:
++    return fmt::format("SX{}{}", mutation.amount < 0 ? "m" : "p", std::abs(mutation.amount));
++  case MutationKind::StickYDelta:
++    return fmt::format("SY{}{}", mutation.amount < 0 ? "m" : "p", std::abs(mutation.amount));
++  case MutationKind::StickYCenter:
++    return "SY_CENTER";
++  case MutationKind::CStickXDelta:
++    return fmt::format("CX{}{}", mutation.amount < 0 ? "m" : "p", std::abs(mutation.amount));
++  case MutationKind::CStickYDelta:
++    return fmt::format("CY{}{}", mutation.amount < 0 ? "m" : "p", std::abs(mutation.amount));
++  }
++  return "?";
++}
++
++std::string MutationName(const Mutation& mutation)
++{
++  return fmt::format("F{}:{}{}", mutation.slot, KindName(mutation),
++                     mutation.duration > 1 ? fmt::format("x{}", mutation.duration) : "");
++}
++
++std::string MakePlanLabel(const std::vector<Mutation>& mutations)
++{
++  if (mutations.empty())
++    return "BASELINE";
++
++  std::string label;
++  for (const Mutation& mutation : mutations)
++  {
++    if (!label.empty())
++      label += '+';
++    label += MutationName(mutation);
++  }
++  return label;
++}
++
++enum class ControlGroup : u8
++{
++  B,
++  L,
++  R,
++  StickX,
++  StickY,
++  CStickX,
++  CStickY,
++};
++
++ControlGroup GetControlGroup(MutationKind kind)
++{
++  switch (kind)
++  {
++  case MutationKind::BOff:
++    return ControlGroup::B;
++  case MutationKind::LOn:
++    return ControlGroup::L;
++  case MutationKind::ROn:
++    return ControlGroup::R;
++  case MutationKind::StickXDelta:
++    return ControlGroup::StickX;
++  case MutationKind::StickYDelta:
++  case MutationKind::StickYCenter:
++    return ControlGroup::StickY;
++  case MutationKind::CStickXDelta:
++    return ControlGroup::CStickX;
++  case MutationKind::CStickYDelta:
++    return ControlGroup::CStickY;
++  }
++  return ControlGroup::B;
++}
++
++u16 LastSlot(const Mutation& mutation)
++{
++  return static_cast<u16>(mutation.slot + 2 * (mutation.duration - 1));
++}
++
++u64 FirstFrame(const Mutation& mutation)
++{
++  return mutation.slot - 1;
++}
++
++bool Compatible(const Mutation& a, const Mutation& b)
++{
++  if (GetControlGroup(a.kind) != GetControlGroup(b.kind))
++    return true;
++  return LastSlot(a) < b.slot || LastSlot(b) < a.slot;
++}
++
++bool CostsMovement(const Mutation& mutation)
++{
++  switch (mutation.kind)
++  {
++  case MutationKind::BOff:
++  case MutationKind::LOn:
++  case MutationKind::ROn:
++  case MutationKind::StickYCenter:
++    return true;
++  case MutationKind::StickYDelta:
++    return mutation.amount < 0;
++  default:
++    return false;
++  }
++}
++
++u32 PlanMovementCost(const std::vector<Mutation>& mutations)
++{
++  std::array<bool, WALKING_LAST_FRAME - (WINDOW_FIRST - 1) + 1> affected{};
++  for (const Mutation& mutation : mutations)
++  {
++    if (!CostsMovement(mutation))
++      continue;
++    const u64 first = std::max<u64>(FirstFrame(mutation), WINDOW_FIRST - 1);
++    const u64 last = std::min<u64>(LastSlot(mutation), WALKING_LAST_FRAME);
++    if (first > last)
++      continue;
++    for (u64 frame = first; frame <= last; ++frame)
++      affected[frame - (WINDOW_FIRST - 1)] = true;
++  }
++  return static_cast<u32>(std::count(affected.begin(), affected.end(), true));
++}
++
++bool MutationCanAffectMovie(const Mutation& mutation)
++{
++  if ((mutation.kind == MutationKind::BOff || mutation.kind == MutationKind::StickYCenter) &&
++      FirstFrame(mutation) > WALKING_LAST_FRAME)
++  {
++    return false;
++  }
++  return true;
++}
++
++void NormalizePlan(Plan& plan)
++{
++  std::vector<Mutation> prepared;
++  prepared.reserve(plan.mutations.size());
++  for (Mutation mutation : plan.mutations)
++  {
++    int slot = std::clamp<int>(mutation.slot, WINDOW_FIRST, s_state.effective_window_last);
++    slot -= (slot - static_cast<int>(WINDOW_FIRST)) & 1;
++    mutation.slot = static_cast<u16>(slot);
++    const u8 available =
++        static_cast<u8>((s_state.effective_window_last - mutation.slot) / 2 + 1);
++    mutation.duration = std::clamp<u8>(mutation.duration, 1,
++                                       std::min<u8>(MAX_HOLD_SLOTS, available));
++
++    if (mutation.kind == MutationKind::StickXDelta ||
++        mutation.kind == MutationKind::StickYDelta ||
++        mutation.kind == MutationKind::CStickXDelta ||
++        mutation.kind == MutationKind::CStickYDelta)
++    {
++      if (mutation.amount == 0)
++        mutation.amount = 32;
++      mutation.amount = std::clamp(mutation.amount, -127, 127);
++    }
++    else
++    {
++      mutation.amount = 0;
++    }
++
++    // Never introduce fresh forward/backward input after the optimized run ends.
++    if (mutation.kind == MutationKind::StickYDelta ||
++        mutation.kind == MutationKind::StickYCenter)
++    {
++      if (mutation.slot > 7952)
++        continue;
++      const u8 walking_available = static_cast<u8>((7952 - mutation.slot) / 2 + 1);
++      mutation.duration = std::min(mutation.duration, walking_available);
++    }
++
++    if (MutationCanAffectMovie(mutation))
++      prepared.push_back(mutation);
++  }
++
++  std::sort(prepared.begin(), prepared.end(), [](const Mutation& a, const Mutation& b) {
++    return std::tie(a.slot, a.kind, a.duration, a.amount) <
++           std::tie(b.slot, b.kind, b.duration, b.amount);
++  });
++
++  std::vector<Mutation> normalized;
++  normalized.reserve(std::min(prepared.size(), MAX_PLAN_MUTATIONS));
++  for (Mutation mutation : prepared)
++  {
++    const bool compatible = std::all_of(
++        normalized.begin(), normalized.end(),
++        [&](const Mutation& existing) { return Compatible(existing, mutation); });
++    if (!compatible)
++      continue;
++
++    while (mutation.duration > 1)
++    {
++      std::vector<Mutation> candidate = normalized;
++      candidate.push_back(mutation);
++      if (PlanMovementCost(candidate) <= MAX_MOVEMENT_COST_FRAMES)
++        break;
++      --mutation.duration;
++    }
++
++    std::vector<Mutation> candidate = normalized;
++    candidate.push_back(mutation);
++    if (PlanMovementCost(candidate) <= MAX_MOVEMENT_COST_FRAMES)
++      normalized.push_back(mutation);
++    if (normalized.size() >= MAX_PLAN_MUTATIONS)
++      break;
++  }
++
++  plan.mutations = std::move(normalized);
++  plan.movement_cost_frames = PlanMovementCost(plan.mutations);
++  plan.label = MakePlanLabel(plan.mutations);
++}
++
++Mutation MakeMutation(u16 slot, MutationKind kind, u8 duration = 1, int amount = 0)
++{
++  return Mutation{slot, duration, kind, amount};
++}
++
++Plan MakePlan(int phase, std::initializer_list<Mutation> mutations)
++{
++  Plan plan;
++  plan.phase = phase;
++  plan.mutations.assign(mutations.begin(), mutations.end());
++  NormalizePlan(plan);
++  return plan;
++}
++
++Plan MakePlan(int phase, std::vector<Mutation> mutations)
++{
++  Plan plan;
++  plan.phase = phase;
++  plan.mutations = std::move(mutations);
++  NormalizePlan(plan);
++  return plan;
++}
++
++bool IsFrameInMutation(u64 frame, const Mutation& mutation)
++{
++  return frame >= FirstFrame(mutation) && frame <= LastSlot(mutation);
++}
++
++u8 AddClamped(u8 value, int delta)
++{
++  return static_cast<u8>(std::clamp(static_cast<int>(value) + delta, 0, 255));
++}
++
++void ApplyMutation(Movie::ControllerState& state, const Mutation& mutation)
++{
++  switch (mutation.kind)
++  {
++  case MutationKind::BOff:
++    state.B = false;
++    break;
++  case MutationKind::LOn:
++    state.L = true;
++    state.TriggerL = 255;
++    break;
++  case MutationKind::ROn:
++    state.R = true;
++    state.TriggerR = 255;
++    break;
++  case MutationKind::StickXDelta:
++    state.AnalogStickX = AddClamped(state.AnalogStickX, mutation.amount);
++    break;
++  case MutationKind::StickYDelta:
++    state.AnalogStickY = AddClamped(state.AnalogStickY, mutation.amount);
++    break;
++  case MutationKind::StickYCenter:
++    state.AnalogStickY = 128;
++    break;
++  case MutationKind::CStickXDelta:
++    state.CStickX = AddClamped(state.CStickX, mutation.amount);
++    break;
++  case MutationKind::CStickYDelta:
++    state.CStickY = AddClamped(state.CStickY, mutation.amount);
++    break;
++  }
++}
++
++SignatureKey Signature(const Outcome& outcome)
++{
++  SignatureKey key{};
++  for (size_t i = 0; i < outcome.events.size(); ++i)
++  {
++    const DropEvent& event = outcome.events[i];
++    const size_t base = i * 6;
++    key[base] = (static_cast<u64>(event.gate_seen) << 63) | event.gate_frame;
++    key[base + 1] = (static_cast<u64>(event.gate_seed) << 32) |
++                    (static_cast<u64>(event.route_seen) << 31) | event.route_seed;
++    key[base + 2] = (static_cast<u64>(event.grenade_seen) << 63) | event.grenade_id;
++    key[base + 3] = (static_cast<u64>(event.late_result_seen) << 63) | event.late_r31;
++    key[base + 4] = event.late_r29;
++    key[base + 5] = (static_cast<u64>(event.final_return_seen) << 1) | event.complete;
++  }
++  return key;
++}
++
++void OpenResultsLocked()
++{
++  File::CreateFullPath(File::GetUserPath(D_LOGS_IDX));
++  const std::string path = File::GetUserPath(D_LOGS_IDX) + std::string(RESULTS_FILENAME);
++  s_state.results = std::ofstream(path, std::ios::out | std::ios::trunc);
++  if (!s_state.results)
++    return;
++
++  s_state.results
++      << "attempt,phase,plan,parent,movement_cost_frames,mutations,completed_drops,"
++         "drop1_frame,drop1_gate,drop1_route,drop1_grenade_id,drop1_late_r31,"
++         "drop1_late_r29,drop1_class,drop2_frame,drop2_gate,drop2_route,"
++         "drop2_grenade_id,drop2_late_r31,drop2_late_r29,drop2_class,has_hand,"
++         "has_9900,target,novel_signature,corpus_size,status,elapsed_ms\n";
++  s_state.results.flush();
++}
++
++void WriteEventCSV(std::ostream& out, const DropEvent& event)
++{
++  out << event.gate_frame << ',' << fmt::format("${:04X}", event.gate_seed) << ','
++      << fmt::format("${:04X}", event.route_seed) << ','
++      << fmt::format("${:08X}", event.grenade_id) << ','
++      << fmt::format("${:08X}", event.late_r31) << ','
++      << fmt::format("${:08X}", event.late_r29) << ',' << EventClass(event);
++}
++
++void WriteResultLocked(const Plan& plan, const Outcome& outcome, double elapsed_ms)
++{
++  if (!s_state.results)
++    return;
++
++  s_state.results << s_state.attempts << ',' << plan.phase << ',' << plan.label << ','
++                  << plan.parent_label << ',' << plan.movement_cost_frames << ','
++                  << plan.mutations.size() << ',' << outcome.completed_count << ',';
++  WriteEventCSV(s_state.results, outcome.events[0]);
++  s_state.results << ',';
++  WriteEventCSV(s_state.results, outcome.events[1]);
++  s_state.results << ',' << (outcome.has_hand ? 1 : 0) << ',' << (outcome.has_9900 ? 1 : 0)
++                  << ',' << (outcome.target ? 1 : 0) << ','
++                  << (outcome.novel_signature ? 1 : 0) << ',' << s_state.corpus.size() << ','
++                  << outcome.status << ',' << fmt::format("{:.3f}", elapsed_ms) << '\n';
++  if ((s_state.attempts % 100) == 0 || outcome.target)
++    s_state.results.flush();
++}
++
++void WriteFoundLocked()
++{
++  File::CreateFullPath(File::GetUserPath(D_LOGS_IDX));
++  const std::string path = File::GetUserPath(D_LOGS_IDX) + std::string(FOUND_FILENAME);
++  std::ofstream out(path, std::ios::out | std::ios::trunc);
++  if (!out)
++    return;
++
++  out << "RE4 JPN VILLAGE DOUBLE-DROP TARGET FOUND\n";
++  out << "Searcher: v6 dual-event coverage-guided\n";
++  out << "Target: Hand Grenade + 9900 ptas, either order\n";
++  out << fmt::format("Attempt: {}\n", s_state.attempts);
++  out << fmt::format("Plan: {}\n", s_state.current_plan.label);
++  out << fmt::format("Parent: {}\n", s_state.current_plan.parent_label);
++  out << fmt::format("Estimated movement cost: {} / {} emulated frames\n",
++                     s_state.current_plan.movement_cost_frames, MAX_MOVEMENT_COST_FRAMES);
++  out << fmt::format("Mutation window used: {}..{}\n", WINDOW_FIRST,
++                     s_state.effective_window_last);
++  for (size_t i = 0; i < s_state.current_outcome.events.size(); ++i)
++  {
++    const DropEvent& event = s_state.current_outcome.events[i];
++    out << fmt::format(
++        "Drop {}: {} | frame {} | gate ${:04X} | route ${:04X} | grenade ${:08X} | "
++        "late r31 ${:08X} r29 ${:08X}\n",
++        i + 1, EventClass(event), event.gate_frame, event.gate_seed, event.route_seed,
++        event.grenade_id, event.late_r31, event.late_r29);
++  }
++  out << "\nA mutation labeled F7826 covers frames 7825 and 7826. An xN suffix holds it "
++         "for N consecutive two-frame TAS slots.\n";
++  out << "Send this file together with the neutral re4-wr-tas1.dtm so a winning DTM can be "
++         "generated exactly.\n";
++}
++
++void WriteSummaryLocked(std::string_view status)
++{
++  File::CreateFullPath(File::GetUserPath(D_LOGS_IDX));
++  const std::string path = File::GetUserPath(D_LOGS_IDX) + std::string(SUMMARY_FILENAME);
++  std::ofstream out(path, std::ios::out | std::ios::trunc);
++  if (!out)
++    return;
++
++  out << "RE4 JPN VILLAGE DOUBLE-DROP SEARCH v6 SUMMARY\n";
++  out << fmt::format("Status: {}\n", status);
++  if (!s_state.validation_error.empty())
++    out << fmt::format("Validation error: {}\n", s_state.validation_error);
++  out << fmt::format("Attempts: {} / {}\n", s_state.attempts, BUDGET);
++  out << "Target: Hand Grenade + 9900 ptas, either order\n";
++  out << fmt::format("Capture frame: {}\n", CAPTURE_FRAME);
++  out << fmt::format("Effective mutation window: {}..{}\n", WINDOW_FIRST,
++                     s_state.effective_window_last);
++  out << fmt::format("Maximum estimated movement cost: {} frames\n",
++                     MAX_MOVEMENT_COST_FRAMES);
++  out << fmt::format("Partial Hand attempts: {}\n", s_state.partial_hand_attempts);
++  out << fmt::format("Partial 9900 attempts: {}\n", s_state.partial_9900_attempts);
++  out << fmt::format("Unique signatures: {}\n", s_state.seen_signatures.size());
++  out << fmt::format("Unique gate seeds: {}\n", s_state.seen_gate_seeds.size());
++  out << fmt::format("Unique route seeds: {}\n", s_state.seen_route_seeds.size());
++  out << fmt::format("Unique grenade IDs: {}\n", s_state.seen_grenade_ids.size());
++  out << fmt::format("Unique ptas values: {}\n", s_state.seen_money_units.size());
++  out << fmt::format("Corpus entries: {}\n", s_state.corpus.size());
++  out << fmt::format("Hand parents: {}\n", s_state.hand_corpus.size());
++  out << fmt::format("9900 parents: {}\n", s_state.money_corpus.size());
++}
++
++bool QueueUniqueLocked(Plan plan)
++{
++  NormalizePlan(plan);
++  if (plan.mutations.empty() || !s_state.known_plan_labels.insert(plan.label).second)
++    return false;
++  s_state.queue.push_back(std::move(plan));
++  return true;
++}
++
++void BuildValidationQueueLocked()
++{
++  Plan first = MakePlan(0, std::initializer_list<Mutation>{});
++  first.label = "BASELINE_A";
++  Plan second = MakePlan(0, std::initializer_list<Mutation>{});
++  second.label = "BASELINE_B";
++  s_state.queue.push_back(std::move(first));
++  s_state.queue.push_back(std::move(second));
++}
++
++void BuildCalibrationQueueLocked()
++{
++  struct Probe
++  {
++    MutationKind kind;
++    u8 duration;
++    int amount;
++  };
++
++  static constexpr Probe probes[] = {
++      {MutationKind::StickXDelta, 1, -64},  {MutationKind::StickXDelta, 1, -32},
++      {MutationKind::StickXDelta, 1, 32},   {MutationKind::StickXDelta, 1, 64},
++      {MutationKind::StickYDelta, 1, -32},  {MutationKind::StickYDelta, 1, 16},
++      {MutationKind::StickYDelta, 1, 32},   {MutationKind::StickYCenter, 1, 0},
++      {MutationKind::CStickXDelta, 1, -64}, {MutationKind::CStickXDelta, 1, 64},
++      {MutationKind::CStickYDelta, 1, -64}, {MutationKind::CStickYDelta, 1, 64},
++      {MutationKind::LOn, 1, 0},            {MutationKind::ROn, 1, 0},
++      {MutationKind::BOff, 1, 0},
++  };
++
++  for (u16 slot = WINDOW_FIRST; slot <= s_state.effective_window_last; slot += 2)
++  {
++    for (const Probe& probe : probes)
++    {
++      QueueUniqueLocked(
++          MakePlan(1, {MakeMutation(slot, probe.kind, probe.duration, probe.amount)}));
++    }
++  }
++  s_state.calibration_built = true;
++}
++
++void RecordCoverageLocked(const Plan& plan, Outcome& outcome)
++{
++  for (const DropEvent& event : outcome.events)
++  {
++    if (event.gate_seen)
++      s_state.seen_gate_seeds.insert(event.gate_seed);
++    if (event.route_seen)
++      s_state.seen_route_seeds.insert(event.route_seed);
++    if (event.grenade_seen)
++      s_state.seen_grenade_ids.insert(event.grenade_id);
++    if (IsMoney(event))
++      s_state.seen_money_units.insert(event.late_r29);
++  }
++
++  outcome.novel_signature = s_state.seen_signatures.insert(Signature(outcome)).second;
++  if ((s_state.corpus.empty() || outcome.novel_signature || outcome.has_hand ||
++       outcome.has_9900) &&
++      s_state.corpus.size() < MAX_CORPUS_ENTRIES)
++  {
++    s_state.corpus.push_back({plan, outcome});
++  }
++
++  if (outcome.has_hand && !outcome.target)
++  {
++    ++s_state.partial_hand_attempts;
++    if (s_state.hand_corpus.size() < MAX_PARTIAL_ENTRIES)
++      s_state.hand_corpus.push_back({plan, outcome});
++  }
++  if (outcome.has_9900 && !outcome.target)
++  {
++    ++s_state.partial_9900_attempts;
++    if (s_state.money_corpus.size() < MAX_PARTIAL_ENTRIES)
++      s_state.money_corpus.push_back({plan, outcome});
++  }
++}
++
++u64 NextRandomLocked()
++{
++  u64 x = s_state.rng_state;
++  x ^= x >> 12;
++  x ^= x << 25;
++  x ^= x >> 27;
++  s_state.rng_state = x;
++  return x * 0x2545F4914F6CDD1DULL;
++}
++
++size_t RandomIndexLocked(size_t count)
++{
++  return count == 0 ? 0 : static_cast<size_t>(NextRandomLocked() % count);
++}
++
++bool ChanceLocked(u32 percent)
++{
++  return RandomIndexLocked(100) < percent;
++}
++
++u8 RandomDurationLocked()
++{
++  const size_t roll = RandomIndexLocked(100);
++  if (roll < 50)
++    return 1;
++  if (roll < 78)
++    return 2;
++  if (roll < 90)
++    return 3;
++  if (roll < 97)
++    return 4;
++  return 6;
++}
++
++u16 RandomSlotLocked(const Plan* local_parent)
++{
++  int slot = WINDOW_FIRST;
++  if (local_parent && !local_parent->mutations.empty() && ChanceLocked(55))
++  {
++    const Mutation& anchor =
++        local_parent->mutations[RandomIndexLocked(local_parent->mutations.size())];
++    slot = static_cast<int>(anchor.slot) + (static_cast<int>(RandomIndexLocked(9)) - 4) * 2;
++  }
++  else if (ChanceLocked(45))
++  {
++    const size_t tail_slots =
++        std::min<size_t>(16, (s_state.effective_window_last - WINDOW_FIRST) / 2 + 1);
++    slot = static_cast<int>(s_state.effective_window_last - 2 * RandomIndexLocked(tail_slots));
++  }
++  else
++  {
++    slot = static_cast<int>(WINDOW_FIRST +
++                            2 * RandomIndexLocked(
++                                    (s_state.effective_window_last - WINDOW_FIRST) / 2 + 1));
++  }
++  return static_cast<u16>(std::clamp<int>(slot, WINDOW_FIRST, s_state.effective_window_last));
++}
++
++Mutation RandomMutationLocked(const Plan* local_parent)
++{
++  static constexpr MutationKind weighted_kinds[] = {
++      MutationKind::BOff,         MutationKind::BOff,         MutationKind::LOn,
++      MutationKind::LOn,          MutationKind::ROn,          MutationKind::ROn,
++      MutationKind::StickXDelta,  MutationKind::StickXDelta,  MutationKind::StickXDelta,
++      MutationKind::StickYDelta,  MutationKind::StickYDelta,  MutationKind::StickYCenter,
++      MutationKind::CStickXDelta, MutationKind::CStickXDelta, MutationKind::CStickYDelta,
++      MutationKind::CStickYDelta};
++  static constexpr int main_amounts[] = {-96, -64, -32, -16, 16, 32, 64, 96};
++  static constexpr int y_amounts[] = {-64, -32, -16, 16, 32};
++
++  const MutationKind kind = weighted_kinds[RandomIndexLocked(std::size(weighted_kinds))];
++  int amount = 0;
++  if (kind == MutationKind::StickYDelta)
++    amount = y_amounts[RandomIndexLocked(std::size(y_amounts))];
++  else if (kind == MutationKind::StickXDelta || kind == MutationKind::CStickXDelta ||
++           kind == MutationKind::CStickYDelta)
++    amount = main_amounts[RandomIndexLocked(std::size(main_amounts))];
++  return MakeMutation(RandomSlotLocked(local_parent), kind, RandomDurationLocked(), amount);
++}
++
++bool AddRandomMutationLocked(Plan& plan, const Plan* local_parent)
++{
++  if (plan.mutations.size() >= MAX_PLAN_MUTATIONS)
++    return false;
++  for (int attempt = 0; attempt < 48; ++attempt)
++  {
++    const Mutation mutation = RandomMutationLocked(local_parent);
++    if (std::all_of(plan.mutations.begin(), plan.mutations.end(),
++                    [&](const Mutation& existing) { return Compatible(existing, mutation); }))
++    {
++      plan.mutations.push_back(mutation);
++      NormalizePlan(plan);
++      return !plan.mutations.empty();
++    }
++  }
++  return false;
++}
++
++Plan SelectParentLocked()
++{
++  const size_t roll = RandomIndexLocked(100);
++  if (!s_state.money_corpus.empty() && roll < 45)
++    return s_state.money_corpus[RandomIndexLocked(s_state.money_corpus.size())].plan;
++  if (!s_state.hand_corpus.empty() && roll < 75)
++    return s_state.hand_corpus[RandomIndexLocked(s_state.hand_corpus.size())].plan;
++  if (!s_state.corpus.empty() && roll < 97)
++    return s_state.corpus[RandomIndexLocked(s_state.corpus.size())].plan;
++  return MakePlan(2, std::initializer_list<Mutation>{});
++}
++
++void EditPlanLocked(Plan& plan)
++{
++  if (plan.mutations.empty())
++  {
++    AddRandomMutationLocked(plan, &plan);
++    return;
++  }
++
++  Mutation& mutation = plan.mutations[RandomIndexLocked(plan.mutations.size())];
++  switch (RandomIndexLocked(4))
++  {
++  case 0:
++    mutation.slot = RandomSlotLocked(&plan);
++    break;
++  case 1:
++    mutation.duration = RandomDurationLocked();
++    break;
++  case 2:
++  {
++    const Mutation replacement = RandomMutationLocked(&plan);
++    mutation.kind = replacement.kind;
++    mutation.amount = replacement.amount;
++    break;
++  }
++  case 3:
++    if (mutation.amount != 0)
++      mutation.amount = -mutation.amount;
++    else
++      mutation.duration = static_cast<u8>(1 + RandomIndexLocked(MAX_HOLD_SLOTS));
++    break;
++  }
++  NormalizePlan(plan);
++}
++
++void SplicePlanLocked(Plan& plan)
++{
++  if (s_state.corpus.empty())
++  {
++    AddRandomMutationLocked(plan, &plan);
++    return;
++  }
++
++  const Plan& other = s_state.corpus[RandomIndexLocked(s_state.corpus.size())].plan;
++  if (other.mutations.empty())
++  {
++    AddRandomMutationLocked(plan, &plan);
++    return;
++  }
++
++  const size_t additions = 1 + RandomIndexLocked(std::min<size_t>(3, other.mutations.size()));
++  for (size_t i = 0; i < additions && plan.mutations.size() < MAX_PLAN_MUTATIONS; ++i)
++    plan.mutations.push_back(other.mutations[RandomIndexLocked(other.mutations.size())]);
++  NormalizePlan(plan);
++}
++
++bool BuildNextAdaptivePlanLocked()
++{
++  for (int generation_attempt = 0; generation_attempt < 1024; ++generation_attempt)
++  {
++    Plan parent = SelectParentLocked();
++    Plan candidate = parent;
++    candidate.phase = 2;
++    candidate.parent_label = parent.label;
++    const size_t operation = RandomIndexLocked(100);
++
++    if (operation < 14)
++    {
++      candidate.mutations.clear();
++      candidate.parent_label = "FRESH";
++      const size_t count = 1 + RandomIndexLocked(7);
++      for (size_t i = 0; i < count; ++i)
++        AddRandomMutationLocked(candidate, &candidate);
++    }
++    else if (operation < 56)
++    {
++      AddRandomMutationLocked(candidate, &parent);
++      if (ChanceLocked(25))
++        AddRandomMutationLocked(candidate, &parent);
++    }
++    else if (operation < 76)
++    {
++      EditPlanLocked(candidate);
++    }
++    else if (operation < 87)
++    {
++      if (!candidate.mutations.empty())
++      {
++        candidate.mutations.erase(candidate.mutations.begin() +
++                                  RandomIndexLocked(candidate.mutations.size()));
++      }
++    }
++    else
++    {
++      SplicePlanLocked(candidate);
++    }
++
++    if (candidate.mutations.empty())
++      AddRandomMutationLocked(candidate, &parent);
++    NormalizePlan(candidate);
++    if (!candidate.mutations.empty() &&
++        !s_state.known_plan_labels.contains(candidate.label))
++    {
++      return QueueUniqueLocked(std::move(candidate));
++    }
++  }
++  return false;
++}
++
++bool ConfigureWindowFromBaselineLocked()
++{
++  if (s_state.validation_outcomes.size() != 2)
++  {
++    s_state.validation_error = "expected two neutral validation attempts";
++    return false;
++  }
++
++  const Outcome& first = s_state.validation_outcomes[0];
++  const Outcome& second = s_state.validation_outcomes[1];
++  if (first.completed_count < 2 || second.completed_count < 2 || first.gate_count < 2 ||
++      second.gate_count < 2)
++  {
++    s_state.validation_error = fmt::format(
++        "neutral replay did not expose two complete drops (first {}/{}, second {}/{})",
++        first.gate_count, first.completed_count, second.gate_count, second.completed_count);
++    return false;
++  }
++  if (Signature(first) != Signature(second))
++  {
++    s_state.validation_error = "two neutral replays produced different drop signatures";
++    return false;
++  }
++
++  const u64 last_gate_frame =
++      std::max(first.events[0].gate_frame, first.events[1].gate_frame);
++  if (last_gate_frame < WINDOW_FIRST - 1 || last_gate_frame > WINDOW_MAX)
++  {
++    s_state.validation_error = fmt::format(
++        "last neutral drop gate was frame {}, outside supported window {}..{}", last_gate_frame,
++        WINDOW_FIRST - 1, WINDOW_MAX);
++    return false;
++  }
++
++  const u64 rounded_slot = (last_gate_frame & 1) != 0 ? last_gate_frame + 1 : last_gate_frame;
++  s_state.effective_window_last =
++      static_cast<u16>(std::clamp<u64>(rounded_slot, WINDOW_FIRST, WINDOW_MAX));
++  return true;
++}
++
++bool PrepareNextPlanLocked()
++{
++  if (s_state.attempts >= BUDGET)
++    return false;
++
++  if (s_state.queue.empty() && !s_state.validation_done)
++  {
++    if (!ConfigureWindowFromBaselineLocked())
++      return false;
++    s_state.validation_done = true;
++    OSD::AddTypedMessage(
++        OSD::MessageType::RE4RNGTrace,
++        fmt::format("RE4 DUAL validation PASSED | drops F{}/F{} | window {}-{}",
++                    s_state.validation_outcomes[0].events[0].gate_frame,
++                    s_state.validation_outcomes[0].events[1].gate_frame, WINDOW_FIRST,
++                    s_state.effective_window_last),
++        OSD::Duration::VERY_LONG, OSD::Color::GREEN);
++    BuildCalibrationQueueLocked();
++  }
++
++  if (s_state.queue.empty() && s_state.validation_done && s_state.calibration_built)
++  {
++    s_state.adaptive_started = true;
++    if (!BuildNextAdaptivePlanLocked())
++      return false;
++  }
++
++  if (s_state.queue.empty())
++    return false;
++
++  s_state.current_plan = std::move(s_state.queue.front());
++  s_state.queue.pop_front();
++  s_state.current_outcome = Outcome{};
++  s_state.attempt_start = std::chrono::steady_clock::now();
++  return true;
++}
++
++void FinishSearchLocked(System* system, std::string_view message, u32 color)
++{
++  s_state.finished = true;
++  s_state.active = false;
++  s_suppress_trace.store(false, std::memory_order_release);
++  Config::SetCurrent(Config::MAIN_EMULATION_SPEED, s_state.previous_speed);
++  if (s_state.results)
++    s_state.results.flush();
++  WriteSummaryLocked(message);
++  OSD::AddTypedMessage(OSD::MessageType::RE4RNGTrace, std::string(message),
++                       OSD::Duration::VERY_LONG, color);
++  if (system)
++    system->GetCPU().Break();
++}
++
++void CaptureOnCPUThread(System* system)
++{
++  {
++    std::lock_guard lock{s_mutex};
++    const auto& movie = system->GetMovie();
++    if (!movie.IsPlayingInput() || movie.GetTotalFrames() != EXPECTED_MOVIE_FRAMES ||
++        movie.GetTotalInputCount() != EXPECTED_MOVIE_INPUTS)
++    {
++      s_state.previous_speed = Config::Get(Config::MAIN_EMULATION_SPEED);
++      s_state.validation_error = fmt::format(
++          "wrong DTM (got {} frames / {} inputs; expected {} / {})", movie.GetTotalFrames(),
++          movie.GetTotalInputCount(), EXPECTED_MOVIE_FRAMES, EXPECTED_MOVIE_INPUTS);
++      FinishSearchLocked(system, "RE4 DUAL FAILED: load the supplied neutral re4-wr-tas1.dtm",
++                         OSD::Color::RED);
++      return;
++    }
++  }
++
++  auto snapshot = ::State::SaveToMemory(*system);
++  {
++    std::lock_guard lock{s_mutex};
++    if (snapshot.empty())
++    {
++      FinishSearchLocked(system, "RE4 DUAL FAILED: in-memory snapshot error", OSD::Color::RED);
++      return;
++    }
++
++    s_state.snapshot = std::move(snapshot);
++    s_state.snapshot_ready = true;
++    s_state.active = true;
++    s_state.previous_speed = Config::Get(Config::MAIN_EMULATION_SPEED);
++    Config::SetCurrent(Config::MAIN_EMULATION_SPEED, 0.0f);
++    s_suppress_trace.store(true, std::memory_order_release);
++    OpenResultsLocked();
++    BuildValidationQueueLocked();
++    PrepareNextPlanLocked();
++    s_state.search_start = std::chrono::steady_clock::now();
++
++    OSD::AddTypedMessage(
++        OSD::MessageType::RE4RNGTrace,
++        fmt::format("RE4 DUAL SEARCH v6 START | F{} snapshot {:.1f} MiB | budget {}",
++                    CAPTURE_FRAME,
++                    static_cast<double>(s_state.snapshot.size()) / (1024.0 * 1024.0), BUDGET),
++        OSD::Duration::VERY_LONG, OSD::Color::GREEN);
++  }
++  system->GetCPU().Continue();
++}
++
++void RestoreOnCPUThread(System* system)
++{
++  std::span<u8> snapshot;
++  {
++    std::lock_guard lock{s_mutex};
++    snapshot = std::span<u8>{s_state.snapshot};
++  }
++
++  const bool ok = ::State::LoadFromMemory(*system, snapshot);
++  {
++    std::lock_guard lock{s_mutex};
++    s_state.restore_requested = false;
++    if (!ok)
++    {
++      FinishSearchLocked(system, "RE4 DUAL FAILED: in-memory restore error", OSD::Color::RED);
++      return;
++    }
++
++    if (!PrepareNextPlanLocked())
++    {
++      if (!s_state.validation_done)
++      {
++        FinishSearchLocked(
++            system,
++            fmt::format("RE4 DUAL validation FAILED | {}", s_state.validation_error),
++            OSD::Color::RED);
++      }
++      else
++      {
++        FinishSearchLocked(
++            system,
++            fmt::format("RE4 DUAL DONE | {} attempts | Hand partials {} | 9900 partials {}",
++                        s_state.attempts, s_state.partial_hand_attempts,
++                        s_state.partial_9900_attempts),
++            OSD::Color::YELLOW);
++      }
++      return;
++    }
++  }
++  system->GetCPU().Continue();
++}
++
++void CompleteAttempt(System* system, std::string status)
++{
++  bool found = false;
++  bool request_restore = false;
++  bool announce_hand = false;
++  bool announce_money = false;
++  u64 attempts = 0;
++  double rate = 0.0;
++  std::string found_plan;
++
++  {
++    std::lock_guard lock{s_mutex};
++    if (!s_state.active || s_state.finished || s_state.restore_requested)
++      return;
++
++    UpdateTarget(s_state.current_outcome);
++    s_state.current_outcome.status = std::move(status);
++    ++s_state.attempts;
++    const double elapsed_ms = std::chrono::duration<double, std::milli>(
++                                  std::chrono::steady_clock::now() - s_state.attempt_start)
++                                  .count();
++    const u64 old_hand_count = s_state.partial_hand_attempts;
++    const u64 old_money_count = s_state.partial_9900_attempts;
++    RecordCoverageLocked(s_state.current_plan, s_state.current_outcome);
++    announce_hand = s_state.partial_hand_attempts != old_hand_count;
++    announce_money = s_state.partial_9900_attempts != old_money_count;
++    WriteResultLocked(s_state.current_plan, s_state.current_outcome, elapsed_ms);
++
++    if (!s_state.validation_done)
++      s_state.validation_outcomes.push_back(s_state.current_outcome);
++
++    if (s_state.current_outcome.target)
++    {
++      s_state.found = true;
++      found = true;
++      WriteFoundLocked();
++      found_plan = s_state.current_plan.label;
++    }
++    else
++    {
++      s_state.restore_requested = true;
++      request_restore = true;
++    }
++
++    attempts = s_state.attempts;
++    const double seconds =
++        std::chrono::duration<double>(std::chrono::steady_clock::now() - s_state.search_start)
++            .count();
++    rate = seconds > 0.0 ? static_cast<double>(attempts) / seconds : 0.0;
++
++    if (announce_money && (s_state.partial_9900_attempts <= 20 ||
++                           (s_state.partial_9900_attempts % 25) == 0))
++    {
++      OSD::AddTypedMessage(
++          OSD::MessageType::RE4RNGTrace,
++          fmt::format("RE4 PARTIAL 9900 | attempt {} | parent saved | total {}", attempts,
++                      s_state.partial_9900_attempts),
++          OSD::Duration::VERY_LONG, OSD::Color::GREEN);
++    }
++    else if (announce_hand && (s_state.partial_hand_attempts <= 20 ||
++                               (s_state.partial_hand_attempts % 50) == 0))
++    {
++      OSD::AddTypedMessage(
++          OSD::MessageType::RE4RNGTrace,
++          fmt::format("RE4 PARTIAL HAND | attempt {} | parent saved | total {}", attempts,
++                      s_state.partial_hand_attempts),
++          OSD::Duration::VERY_LONG, OSD::Color::CYAN);
++    }
++
++    if ((attempts % 100) == 0)
++    {
++      OSD::AddTypedMessage(
++          OSD::MessageType::RE4RNGTrace,
++          fmt::format(
++              "RE4 DUAL | {} | {:.2f}/s | phase {} | cost {}/4 | corpus {} | H {} | P {}",
++              attempts, rate, s_state.current_plan.phase,
++              s_state.current_plan.movement_cost_frames, s_state.corpus.size(),
++              s_state.partial_hand_attempts, s_state.partial_9900_attempts),
++          OSD::Duration::VERY_LONG, OSD::Color::CYAN);
++    }
++  }
++
++  if (found)
++  {
++    std::lock_guard lock{s_mutex};
++    FinishSearchLocked(
++        system, fmt::format("RE4 DUAL TARGET FOUND | attempt {} | {}", attempts, found_plan),
++        OSD::Color::GREEN);
++    return;
++  }
++
++  if (request_restore)
++  {
++    system->GetCPU().AddCPUThreadJob([system] { RestoreOnCPUThread(system); });
++    system->GetCPU().Break();
++  }
++}
++
++DropEvent* ActiveDropEvent(Outcome& outcome)
++{
++  if (outcome.active_event < 0 ||
++      outcome.active_event >= static_cast<int>(outcome.events.size()))
++  {
++    return nullptr;
++  }
++  return &outcome.events[static_cast<size_t>(outcome.active_event)];
++}
++
++void CompleteDropEvent(Outcome& outcome, DropEvent& event)
++{
++  if (!event.complete)
++  {
++    event.complete = true;
++    ++outcome.completed_count;
++  }
++}
++}  // namespace
++
++void ResetSession()
++{
++  std::lock_guard lock{s_mutex};
++  if (s_state.results.is_open())
++    s_state.results.close();
++  s_state = SearchState{};
++  s_suppress_trace.store(false, std::memory_order_release);
++  OSD::AddTypedMessage(
++      OSD::MessageType::RE4RNGTrace,
++      fmt::format("RE4 dual-drop v6 armed | capture F{} | starts F{} | max cost {}f",
++                  CAPTURE_FRAME, WINDOW_FIRST - 1, MAX_MOVEMENT_COST_FRAMES),
++      OSD::Duration::VERY_LONG, OSD::Color::GREEN);
++}
++
++void MutateMovieControllerState(u64 movie_frame, Movie::ControllerState& state)
++{
++  std::lock_guard lock{s_mutex};
++  if (!s_state.active || s_state.finished)
++    return;
++  for (const Mutation& mutation : s_state.current_plan.mutations)
++  {
++    if (IsFrameInMutation(movie_frame, mutation))
++      ApplyMutation(state, mutation);
++  }
++}
++
++void OnPadPoll(u64 movie_frame)
++{
++  bool request_capture = false;
++  bool close_attempt = false;
++  std::string close_status;
++  {
++    std::lock_guard lock{s_mutex};
++    if (s_state.armed && !s_state.capture_requested && !s_state.snapshot_ready &&
++        !s_state.finished && movie_frame >= CAPTURE_FRAME)
++    {
++      s_state.capture_requested = true;
++      request_capture = true;
++    }
++    else if (s_state.active && !s_state.restore_requested && !s_state.finished &&
++             movie_frame >= HARD_END_FRAME)
++    {
++      UpdateTarget(s_state.current_outcome);
++      close_attempt = true;
++      close_status = fmt::format("timeout_{}_gates_{}_complete", s_state.current_outcome.gate_count,
++                                 s_state.current_outcome.completed_count);
++    }
++  }
++
++  System* const system = &System::GetInstance();
++  if (request_capture)
++  {
++    system->GetCPU().AddCPUThreadJob([system] { CaptureOnCPUThread(system); });
++    system->GetCPU().Break();
++  }
++  else if (close_attempt)
++  {
++    CompleteAttempt(system, std::move(close_status));
++  }
++}
++
++bool OnDropProbe(System* system, u32 pc)
++{
++  if (!system || !s_suppress_trace.load(std::memory_order_acquire))
++    return false;
++
++  bool complete_now = false;
++  bool target = false;
++  {
++    std::lock_guard lock{s_mutex};
++    if (!s_state.active || s_state.finished)
++      return true;
++
++    Outcome& outcome = s_state.current_outcome;
++    const u16 seed = system->GetMemory().Read_U16(RE4RNGTrace::RNG_STATE_ADDRESS);
++    const u64 frame = system->GetMovie().GetCurrentFrame();
++    const auto& ppc_state = system->GetPowerPC().GetPPCState();
++
++    if (pc == GATE_PC)
++    {
++      if (DropEvent* previous = ActiveDropEvent(outcome))
++        CompleteDropEvent(outcome, *previous);
++
++      const int next_event = outcome.active_event + 1;
++      ++outcome.gate_count;
++      if (next_event >= static_cast<int>(outcome.events.size()))
++      {
++        outcome.overflow = true;
++      }
++      else
++      {
++        outcome.active_event = next_event;
++        DropEvent& event = outcome.events[static_cast<size_t>(next_event)];
++        event.gate_seen = true;
++        event.gate_frame = frame;
++        event.gate_seed = seed;
++      }
++    }
++    else if (DropEvent* event = ActiveDropEvent(outcome))
++    {
++      if (pc == ROUTE_PC)
++      {
++        event->route_seen = true;
++        event->route_seed = seed;
++      }
++      else if (pc == GRENADE_FINAL_ID_PC)
++      {
++        event->grenade_seen = true;
++        event->grenade_id = ppc_state.gpr[29];
++      }
++      else if (pc == LATE_DROP_RESULT_PC)
++      {
++        event->late_result_seen = true;
++        event->late_r31 = ppc_state.gpr[31];
++        event->late_r29 = ppc_state.gpr[29];
++      }
++      else if (pc == DROP_FINAL_RETURN_PC)
++      {
++        event->final_return_seen = true;
++        CompleteDropEvent(outcome, *event);
++      }
++    }
++
++    UpdateTarget(outcome);
++    target = outcome.target;
++    complete_now = target || outcome.completed_count >= 2;
++  }
++
++  if (complete_now)
++    CompleteAttempt(system, target ? "target" : "two_drops");
++  return true;
++}
++
++bool IsSuppressingTrace()
++{
++  return s_suppress_trace.load(std::memory_order_acquire);
++}
++
++}  // namespace Core::RE4RNGSearch
+diff --git a/Source/Core/Core/RE4RNGSearch.h b/Source/Core/Core/RE4RNGSearch.h
+new file mode 100644
+index 0000000..0a6cfce
+--- /dev/null
++++ b/Source/Core/Core/RE4RNGSearch.h
+@@ -0,0 +1,34 @@
++// Copyright 2026 Dolphin Emulator Project
++// SPDX-License-Identifier: GPL-2.0-or-later
++
++#pragma once
++
++#include "Common/CommonTypes.h"
++
++namespace Movie
++{
++struct ControllerState;
++}
++
++namespace Core
++{
++class System;
++
++namespace RE4RNGSearch
++{
++void ResetSession();
++
++// Called immediately after a GameCube movie controller state is read from the DTM.
++void MutateMovieControllerState(u64 movie_frame, Movie::ControllerState& state);
++
++// Called once for each controller-1 poll. It captures the in-memory checkpoint and closes
++// attempts that did not finish both village drop events.
++void OnPadPoll(u64 movie_frame);
++
++// Called at known RE4 drop PCs. Returns true while the search owns the event.
++bool OnDropProbe(System* system, u32 pc);
++
++// Hot-loop tracer logging is disabled during the search.
++bool IsSuppressingTrace();
++}  // namespace RE4RNGSearch
++}  // namespace Core
+diff --git a/Source/Core/Core/RE4RNGTrace.cpp b/Source/Core/Core/RE4RNGTrace.cpp
+new file mode 100644
+index 0000000..e9fa1ef
+--- /dev/null
++++ b/Source/Core/Core/RE4RNGTrace.cpp
+@@ -0,0 +1,392 @@
++// Copyright 2026 Dolphin Emulator Project
++// SPDX-License-Identifier: GPL-2.0-or-later
++
++#include "Core/RE4RNGTrace.h"
++
++#include <array>
++#include <fstream>
++#include <mutex>
++#include <string>
++#include <string_view>
++#include <utility>
++
++#include <fmt/format.h>
++
++#include "Common/FileUtil.h"
++#include "Core/ConfigManager.h"
++#include "Core/RE4RNGSearch.h"
++#include "Core/HW/Memmap.h"
++#include "Core/PowerPC/Gekko.h"
++#include "Core/PowerPC/PowerPC.h"
++#include "Core/System.h"
++#include "InputCommon/GCPadStatus.h"
++#include "VideoCommon/OnScreenDisplay.h"
++
++namespace Core::RE4RNGTrace
++{
++namespace
++{
++constexpr std::string_view TARGET_GAME_ID = "G4BJ08";
++constexpr std::string_view RNG_TRACE_FILENAME = "re4_jpn_rng_trace.csv";
++constexpr std::string_view PAD_TRACE_FILENAME = "re4_jpn_pad_trace.csv";
++constexpr std::string_view DROP_TRACE_FILENAME = "re4_jpn_drop_trace.csv";
++
++struct InputSnapshot
++{
++  u16 buttons = 0;
++  u8 stick_x = GCPadStatus::MAIN_STICK_CENTER_X;
++  u8 stick_y = GCPadStatus::MAIN_STICK_CENTER_Y;
++  u8 cstick_x = GCPadStatus::C_STICK_CENTER_X;
++  u8 cstick_y = GCPadStatus::C_STICK_CENTER_Y;
++  u8 trigger_l = 0;
++  u8 trigger_r = 0;
++  u8 analog_a = 0;
++  u8 analog_b = 0;
++  bool connected = false;
++};
++
++struct TraceState
++{
++  bool active = false;
++  u64 frame = 0;
++  u64 input_count = 0;
++  u64 poll_index = 0;
++  u64 total_calls = 0;
++  u64 external_calls = 0;
++  u64 calls_this_poll = 0;
++  u64 calls_previous_poll = 0;
++  u64 drop_probe_index = 0;
++  u32 last_caller = 0;
++  u16 last_seed_before = 0;
++  u16 last_seed_after = 0;
++  u8 last_rng_byte = 0;
++  InputSnapshot input{};
++  std::ofstream rng_log;
++  std::ofstream pad_log;
++  std::ofstream drop_log;
++};
++
++std::mutex s_mutex;
++TraceState s_state;
++
++bool IsTargetGame()
++{
++  return SConfig::GetInstance().GetGameID() == TARGET_GAME_ID;
++}
++
++bool IsInternalRNGCaller(u32 caller)
++{
++  // Calls made from inside the RNG routine itself dominate the v1 log and are not useful for
++  // input-to-callsite comparisons. We still count them in total_calls; we simply do not emit rows.
++  return caller >= 0x8014BDA0 && caller <= 0x8014BE60;
++}
++
++std::pair<u16, u8> NextRNG(u16 old_seed)
++{
++  const u16 shifted = static_cast<u16>(old_seed >> 1);
++  const u8 low = static_cast<u8>(shifted & 0xFF);
++  const u8 high = static_cast<u8>((shifted + (old_seed >> 8)) & 0xFF);
++
++  u16 next = static_cast<u16>((static_cast<u16>(high) << 8) | low);
++  if (next == old_seed)
++    next = static_cast<u16>(next + 0x0101);
++
++  return {next, static_cast<u8>(next >> 8)};
++}
++
++std::string_view DropProbeLabel(u32 pc)
++{
++  switch (pc)
++  {
++  case 0x800D1978:
++    return "drop_path_1978";
++  case 0x800D1B34:
++    return "drop_path_1B34";
++  case 0x800D1E9C:
++    return "grenade_type_roll";
++  case 0x800D1EF0:
++    return "grenade_final_id_checkpoint";
++  case 0x800D224C:
++    return "ammo_item_path";
++  case 0x800D23F8:
++    return "quantity_checkpoint";
++  case 0x800D24B8:
++    return "drop_path_24B8";
++  case 0x800D2770:
++    return "drop_path_2770";
++  case 0x800D2794:
++    return "drop_gate_rng_call";
++  case 0x800D2798:
++    return "drop_gate_after_rng";
++  case 0x800D27B0:
++    return "drop_path_27B0";
++  case 0x800D2B64:
++    return "drop_selected_path";
++  case 0x800D2BF0:
++    return "ammo_path_checkpoint";
++  case 0x800D2FC0:
++    return "late_drop_rng_checkpoint";
++  case 0x800D2FD0:
++    return "late_drop_rng_call";
++  case 0x800D2FE0:
++    return "late_drop_result_pre";
++  case 0x800D2FE4:
++    return "late_drop_result";
++  case 0x800D2FF8:
++    return "drop_final_return";
++  default:
++    return "unknown";
++  }
++}
++
++void OpenTraceFiles()
++{
++  File::CreateFullPath(File::GetUserPath(D_LOGS_IDX));
++  const std::string logs_path = File::GetUserPath(D_LOGS_IDX);
++
++  s_state.rng_log =
++      std::ofstream(logs_path + std::string(RNG_TRACE_FILENAME), std::ios::out | std::ios::trunc);
++  s_state.pad_log =
++      std::ofstream(logs_path + std::string(PAD_TRACE_FILENAME), std::ios::out | std::ios::trunc);
++  s_state.drop_log =
++      std::ofstream(logs_path + std::string(DROP_TRACE_FILENAME), std::ios::out | std::ios::trunc);
++
++  if (s_state.rng_log)
++  {
++    s_state.rng_log
++        << "call_index,external_index,frame,input_count,poll_index,call_in_poll,caller,lr,"
++           "seed_before,seed_after,rng_byte,buttons,stick_x,stick_y,cstick_x,cstick_y,"
++           "trigger_l,trigger_r,analog_a,analog_b,connected\n";
++    s_state.rng_log.flush();
++  }
++
++  if (s_state.pad_log)
++  {
++    s_state.pad_log
++        << "poll_index,frame,input_count,rng_calls_previous_poll,buttons,stick_x,stick_y,"
++           "cstick_x,cstick_y,trigger_l,trigger_r,analog_a,analog_b,connected\n";
++    s_state.pad_log.flush();
++  }
++
++  if (s_state.drop_log)
++  {
++    s_state.drop_log
++        << "probe_index,frame,input_count,poll_index,pc,label,seed,lr,ctr,cr,xer,"
++           "buttons,stick_x,stick_y,cstick_x,cstick_y,trigger_l,trigger_r,analog_a,analog_b,"
++           "r0,r1,r2,r3,r4,r5,r6,r7,r8,r9,r10,r11,r12,r13,r14,r15,r16,r17,r18,r19,"
++           "r20,r21,r22,r23,r24,r25,r26,r27,r28,r29,r30,r31\n";
++    s_state.drop_log.flush();
++  }
++}
++
++void EnsureActive()
++{
++  if (s_state.active)
++    return;
++
++  s_state.active = true;
++  OpenTraceFiles();
++}
++
++void UpdateHUD()
++{
++  if (!s_state.active)
++    return;
++
++  const std::string text = fmt::format(
++      "RE4 RNG v2 | F:{} Poll:{} PrevCalls:{} Total:{} Ext:{}\n"
++      "Caller:${:08X} Seed:${:04X}->${:04X} Byte:${:02X} Btn:${:04X} "
++      "LS:{:02X},{:02X} CS:{:02X},{:02X}",
++      s_state.frame, s_state.poll_index, s_state.calls_previous_poll, s_state.total_calls,
++      s_state.external_calls, s_state.last_caller, s_state.last_seed_before,
++      s_state.last_seed_after, s_state.last_rng_byte, s_state.input.buttons,
++      s_state.input.stick_x, s_state.input.stick_y, s_state.input.cstick_x,
++      s_state.input.cstick_y);
++
++  OSD::AddTypedMessage(OSD::MessageType::RE4RNGTrace, text, OSD::Duration::VERY_LONG,
++                       OSD::Color::CYAN);
++}
++}  // namespace
++
++bool IsDropProbeAddress(u32 pc)
++{
++  switch (pc)
++  {
++  case 0x800D1978:
++  case 0x800D1B34:
++  case 0x800D1E9C:
++  case 0x800D1EF0:
++  case 0x800D224C:
++  case 0x800D23F8:
++  case 0x800D24B8:
++  case 0x800D2770:
++  case 0x800D2794:
++  case 0x800D2798:
++  case 0x800D27B0:
++  case 0x800D2B64:
++  case 0x800D2BF0:
++  case 0x800D2FC0:
++  case 0x800D2FD0:
++  case 0x800D2FE0:
++  case 0x800D2FE4:
++  case 0x800D2FF8:
++    return true;
++  default:
++    return false;
++  }
++}
++
++void ResetSession()
++{
++  std::lock_guard lock{s_mutex};
++
++  if (s_state.rng_log.is_open())
++    s_state.rng_log.close();
++  if (s_state.pad_log.is_open())
++    s_state.pad_log.close();
++  if (s_state.drop_log.is_open())
++    s_state.drop_log.close();
++
++  s_state = TraceState{};
++  s_state.active = IsTargetGame();
++  if (!s_state.active)
++    return;
++
++  OpenTraceFiles();
++  Core::RE4RNGSearch::ResetSession();
++  OSD::AddTypedMessage(
++      OSD::MessageType::RE4RNGTrace,
++      fmt::format("RE4 JPN RNG tracer v2 armed | RNG ${:08X} | seed ${:08X} | drop probes ON",
++                  RNG_FUNCTION_ADDRESS, RNG_STATE_ADDRESS),
++      OSD::Duration::VERY_LONG, OSD::Color::GREEN);
++}
++
++void OnPadStatus(const GCPadStatus& pad_status, int controller_id, u64 frame, u64 input_count)
++{
++  if (controller_id != 0 || !IsTargetGame())
++    return;
++
++  Core::RE4RNGSearch::OnPadPoll(frame);
++  if (Core::RE4RNGSearch::IsSuppressingTrace())
++    return;
++
++  std::lock_guard lock{s_mutex};
++  EnsureActive();
++
++  s_state.calls_previous_poll = s_state.calls_this_poll;
++  s_state.calls_this_poll = 0;
++  s_state.frame = frame;
++  s_state.input_count = input_count;
++  ++s_state.poll_index;
++
++  s_state.input.buttons = pad_status.button;
++  s_state.input.stick_x = pad_status.stickX;
++  s_state.input.stick_y = pad_status.stickY;
++  s_state.input.cstick_x = pad_status.substickX;
++  s_state.input.cstick_y = pad_status.substickY;
++  s_state.input.trigger_l = pad_status.triggerLeft;
++  s_state.input.trigger_r = pad_status.triggerRight;
++  s_state.input.analog_a = pad_status.analogA;
++  s_state.input.analog_b = pad_status.analogB;
++  s_state.input.connected = pad_status.isConnected;
++
++  if (s_state.pad_log)
++  {
++    s_state.pad_log << fmt::format(
++        "{},{},{},{},${:04X},{},{},{},{},{},{},{},{},{}\n", s_state.poll_index,
++        s_state.frame, s_state.input_count, s_state.calls_previous_poll, s_state.input.buttons,
++        s_state.input.stick_x, s_state.input.stick_y, s_state.input.cstick_x,
++        s_state.input.cstick_y, s_state.input.trigger_l, s_state.input.trigger_r,
++        s_state.input.analog_a, s_state.input.analog_b, s_state.input.connected ? 1 : 0);
++
++    if ((s_state.poll_index & 0x3F) == 0)
++      s_state.pad_log.flush();
++  }
++
++  UpdateHUD();
++}
++
++void OnRNGFunctionEntry(System* system)
++{
++  if (system == nullptr || !IsTargetGame() || Core::RE4RNGSearch::IsSuppressingTrace())
++    return;
++
++  const auto& ppc_state = system->GetPowerPC().GetPPCState();
++  const u32 lr = ppc_state.spr[SPR_LR];
++  const u32 caller = lr >= 4 ? lr - 4 : 0;
++  const u16 seed_before = system->GetMemory().Read_U16(RNG_STATE_ADDRESS);
++  const auto [seed_after, rng_byte] = NextRNG(seed_before);
++
++  std::lock_guard lock{s_mutex};
++  EnsureActive();
++
++  ++s_state.total_calls;
++  ++s_state.calls_this_poll;
++  s_state.last_caller = caller;
++  s_state.last_seed_before = seed_before;
++  s_state.last_seed_after = seed_after;
++  s_state.last_rng_byte = rng_byte;
++
++  if (IsInternalRNGCaller(caller))
++    return;
++
++  ++s_state.external_calls;
++  if (s_state.rng_log)
++  {
++    s_state.rng_log << fmt::format(
++        "{},{},{},{},{},{},${:08X},${:08X},${:04X},${:04X},${:02X},${:04X},"
++        "{},{},{},{},{},{},{},{},{}\n",
++        s_state.total_calls, s_state.external_calls, s_state.frame, s_state.input_count,
++        s_state.poll_index, s_state.calls_this_poll, caller, lr, seed_before, seed_after, rng_byte,
++        s_state.input.buttons, s_state.input.stick_x, s_state.input.stick_y,
++        s_state.input.cstick_x, s_state.input.cstick_y, s_state.input.trigger_l,
++        s_state.input.trigger_r, s_state.input.analog_a, s_state.input.analog_b,
++        s_state.input.connected ? 1 : 0);
++
++    if ((s_state.external_calls & 0x3F) == 0)
++      s_state.rng_log.flush();
++  }
++}
++
++void OnDropProbeEntry(System* system, u32 pc)
++{
++  if (system == nullptr || !IsTargetGame() || !IsDropProbeAddress(pc))
++    return;
++
++  if (Core::RE4RNGSearch::OnDropProbe(system, pc))
++    return;
++
++  const auto& ppc_state = system->GetPowerPC().GetPPCState();
++  const u16 seed = system->GetMemory().Read_U16(RNG_STATE_ADDRESS);
++  const u32 lr = ppc_state.spr[SPR_LR];
++  const u32 ctr = ppc_state.spr[SPR_CTR];
++  const u32 cr = ppc_state.cr.Get();
++  const u32 xer = ppc_state.GetXER().Hex;
++
++  std::lock_guard lock{s_mutex};
++  EnsureActive();
++  ++s_state.drop_probe_index;
++
++  if (!s_state.drop_log)
++    return;
++
++  s_state.drop_log << fmt::format(
++      "{},{},{},{},${:08X},{},${:04X},${:08X},${:08X},${:08X},${:08X},"
++      "${:04X},{},{},{},{},{},{},{},{},",
++      s_state.drop_probe_index, s_state.frame, s_state.input_count, s_state.poll_index, pc,
++      DropProbeLabel(pc), seed, lr, ctr, cr, xer, s_state.input.buttons, s_state.input.stick_x,
++      s_state.input.stick_y, s_state.input.cstick_x, s_state.input.cstick_y,
++      s_state.input.trigger_l, s_state.input.trigger_r, s_state.input.analog_a,
++      s_state.input.analog_b);
++
++  for (size_t i = 0; i < std::size(ppc_state.gpr); ++i)
++  {
++    if (i != 0)
++      s_state.drop_log << ',';
++    s_state.drop_log << fmt::format("${:08X}", ppc_state.gpr[i]);
++  }
++  s_state.drop_log << '\n';
++  s_state.drop_log.flush();
++}
++
++}  // namespace Core::RE4RNGTrace
+diff --git a/Source/Core/Core/RE4RNGTrace.h b/Source/Core/Core/RE4RNGTrace.h
+new file mode 100644
+index 0000000..d2ecef3
+--- /dev/null
++++ b/Source/Core/Core/RE4RNGTrace.h
+@@ -0,0 +1,36 @@
++// Copyright 2026 Dolphin Emulator Project
++// SPDX-License-Identifier: GPL-2.0-or-later
++
++#pragma once
++
++#include "Common/CommonTypes.h"
++
++struct GCPadStatus;
++
++namespace Core
++{
++class System;
++
++namespace RE4RNGTrace
++{
++constexpr u32 RNG_FUNCTION_ADDRESS = 0x8014BDA0;
++constexpr u32 RNG_STATE_ADDRESS = 0x802B69BC;
++
++// Starts a fresh trace when Biohazard 4 JPN (G4BJ08) boots.
++// For other games this is a no-op.
++void ResetSession();
++
++// Captures every GameCube controller poll delivered to controller 1.
++void OnPadStatus(const GCPadStatus& pad_status, int controller_id, u64 frame, u64 input_count);
++
++// Called at the entry of $8014BDA0 on the emulated CPU thread.
++void OnRNGFunctionEntry(System* system);
++
++// True for RE4 JPN drop-related PCs instrumented by the tracer.
++bool IsDropProbeAddress(u32 pc);
++
++// Called before executing a drop-related instruction. Dumps PPC register state.
++void OnDropProbeEntry(System* system, u32 pc);
++
++}  // namespace RE4RNGTrace
++}  // namespace Core
+diff --git a/Source/Core/Core/State.cpp b/Source/Core/Core/State.cpp
+index 2dcd2ca..e972be8 100644
+--- a/Source/Core/Core/State.cpp
++++ b/Source/Core/Core/State.cpp
+@@ -258,6 +258,22 @@ static std::size_t SaveToBuffer(Core::System& system, Common::UniqueBuffer<u8>&
+   return 0;
+ }
+ 
++std::vector<u8> SaveToMemory(Core::System& system)
++{
++  const std::size_t estimate = static_cast<std::size_t>(s_last_state_size) * 110 / 100;
++  Common::UniqueBuffer<u8> buffer{estimate};
++  const std::size_t actual_size = SaveToBuffer(system, buffer);
++  if (actual_size == 0)
++    return {};
++
++  return {buffer.data(), buffer.data() + actual_size};
++}
++
++bool LoadFromMemory(Core::System& system, std::span<u8> buffer)
++{
++  return !buffer.empty() && LoadFromBuffer(system, buffer);
++}
++
+ namespace
+ {
+ struct SlotWithTimestamp
+diff --git a/Source/Core/Core/State.h b/Source/Core/Core/State.h
+index cd35ea1..0f73f13 100644
+--- a/Source/Core/Core/State.h
++++ b/Source/Core/Core/State.h
+@@ -7,7 +7,9 @@
+ 
+ #include <cstddef>
+ #include <functional>
++#include <span>
+ #include <string>
++#include <vector>
+ #include <type_traits>
+ 
+ #include "Common/CommonTypes.h"
+@@ -98,6 +100,11 @@ void Load(Core::System& system, u32 slot);
+ void SaveAs(Core::System& system, std::string filename);
+ void LoadAs(Core::System& system, std::string filename);
+ 
++// Lightweight uncompressed snapshots for deterministic internal search/benchmark tools.
++// These must be called on the CPU thread.
++std::vector<u8> SaveToMemory(Core::System& system);
++bool LoadFromMemory(Core::System& system, std::span<u8> buffer);
++
+ void LoadLastSaved(Core::System& system, int i = 1);
+ void SaveFirstSaved(Core::System& system);
+ void UndoSaveState(Core::System& system);
+diff --git a/Source/Core/VideoCommon/OnScreenDisplay.h b/Source/Core/VideoCommon/OnScreenDisplay.h
+index 2819de5..7f7bdfe 100644
+--- a/Source/Core/VideoCommon/OnScreenDisplay.h
++++ b/Source/Core/VideoCommon/OnScreenDisplay.h
+@@ -18,6 +18,7 @@ enum class MessageType
+ {
+   NetPlayPing,
+   NetPlayBuffer,
++  RE4RNGTrace,
+ 
+   // This entry must be kept last so that persistent typed messages are
+   // displayed before other messages
