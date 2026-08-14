@@ -500,6 +500,8 @@ add_library(core
   MemTools.h
   Movie.cpp
   Movie.h
+  RE4TASHUD.cpp
+  RE4TASHUD.h
   NetPlayClient.cpp
   NetPlayClient.h
   NetPlayCommon.cpp
