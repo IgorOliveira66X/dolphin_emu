@@ -58,6 +58,7 @@
 #include "Core/IOS/USB/Bluetooth/BTEmu.h"
 #include "Core/IOS/USB/Bluetooth/WiimoteDevice.h"
 #include "Core/NetPlayProto.h"
+#include "Core/RE4TASHUD.h"
 #include "Core/State.h"
 #include "Core/System.h"
 #include "Core/WiiUtils.h"
@@ -190,6 +191,8 @@ void MovieManager::FrameUpdate()
 // NOTE: EmuThread
 void MovieManager::Init(const BootParameters& boot)
 {
+  Core::RE4TASHUD::ResetSession();
+
   if (std::holds_alternative<BootParameters::Disc>(boot.parameters))
     m_current_file_name = std::get<BootParameters::Disc>(boot.parameters).path;
   else
@@ -765,6 +768,9 @@ void MovieManager::CheckPadStatus(const GCPadStatus* PadStatus, int controllerID
   m_pad_state.reset = m_reset;
   m_reset = false;
 
+  Core::RE4TASHUD::OnPadPoll(m_system, controllerID, m_current_frame,
+                            m_current_input_count + 1);
+
   {
     std::string display_str = GenerateInputDisplayString(m_pad_state, controllerID);
 
@@ -1196,6 +1202,9 @@ void MovieManager::PlayController(GCPadStatus* PadStatus, int controllerID)
 
   if (m_pad_state.reset)
     m_system.GetProcessorInterface().ResetButton_Tap();
+
+  Core::RE4TASHUD::OnPadPoll(m_system, controllerID, m_current_frame,
+                            m_current_input_count + 1);
 
   {
     std::string display_str = GenerateInputDisplayString(m_pad_state, controllerID);
