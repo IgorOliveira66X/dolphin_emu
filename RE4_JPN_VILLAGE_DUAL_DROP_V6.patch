@@ -123,10 +123,10 @@ index 1248b1a..408bf5b 100644
        if (IsBranchWatchEnabled())
 diff --git a/Source/Core/Core/RE4RNGSearch.cpp b/Source/Core/Core/RE4RNGSearch.cpp
 new file mode 100644
-index 0000000..3116619
+index 0000000..d343783
 --- /dev/null
 +++ b/Source/Core/Core/RE4RNGSearch.cpp
-@@ -0,0 +1,1373 @@
+@@ -0,0 +1,1374 @@
 +// Copyright 2026 Dolphin Emulator Project
 +// SPDX-License-Identifier: GPL-2.0-or-later
 +
@@ -643,7 +643,8 @@ index 0000000..3116619
 +    key[base + 2] = (static_cast<u64>(event.grenade_seen) << 63) | event.grenade_id;
 +    key[base + 3] = (static_cast<u64>(event.late_result_seen) << 63) | event.late_r31;
 +    key[base + 4] = event.late_r29;
-+    key[base + 5] = (static_cast<u64>(event.final_return_seen) << 1) | event.complete;
++    key[base + 5] = (static_cast<u64>(event.final_return_seen) << 1) |
++                    static_cast<u64>(event.complete);
 +  }
 +  return key;
 +}
