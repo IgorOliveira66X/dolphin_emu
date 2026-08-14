@@ -2,6 +2,10 @@ name: RE4 JPN Village Dual Drop v6 Windows Build
 
 on:
   workflow_dispatch:
+  pull_request:
+    paths:
+      - RE4_JPN_VILLAGE_DUAL_DROP_V6.patch
+      - .github/workflows/re4-jpn-village-dual-drop-v6-windows.yml
   push:
     branches:
       - agent/re4-jpn-village-dual-drop-v6
