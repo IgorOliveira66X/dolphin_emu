@@ -1,0 +1,58 @@
+name: RE4 JPN Generic Drop Search v7 Windows Build
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - agent/re4-jpn-drop-search-v7-generic
+    paths:
+      - Source/Core/Core/Movie.cpp
+      - Source/Core/Core/Movie.h
+      - Source/Core/Core/RE4RNGSearch.cpp
+      - Source/Core/Core/RE4RNGSearch.h
+      - RE4DropSearch.ini
+      - RE4_DROP_SEARCH_V7_README.txt
+      - .github/workflows/re4-jpn-drop-search-v7-windows.yml
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: windows-2025-vs2026
+    timeout-minutes: 120
+
+    steps:
+      - name: Checkout Dolphin with submodules
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 1
+
+      - name: Verify source tree
+        shell: pwsh
+        run: git diff --check
+
+      - name: Configure and build Release x64
+        shell: pwsh
+        run: cmake --workflow --preset visualstudio-release-x64
+
+      - name: Assemble portable searcher
+        shell: pwsh
+        run: |
+          $binaries = Resolve-Path build/release/x64/Binaries
+          $exe = Get-ChildItem -Path $binaries -Filter Dolphin.exe -Recurse | Select-Object -First 1
+          if (-not $exe) { throw 'Dolphin.exe was not produced.' }
+          Copy-Item RE4DropSearch.ini (Join-Path $binaries 'RE4DropSearch.ini') -Force
+          Copy-Item RE4_DROP_SEARCH_V7_README.txt (Join-Path $binaries 'RE4_DROP_SEARCH_V7_README.txt') -Force
+          New-Item (Join-Path $binaries 'portable.txt') -ItemType File -Force | Out-Null
+          Write-Host "Built executable: $($exe.FullName)"
+
+      - name: Upload portable Dolphin build
+        uses: actions/upload-artifact@v4
+        with:
+          name: Dolphin-RE4-JPN-Generic-Drop-Search-v7-Windows-x64
+          path: build/release/x64/Binaries/**
+          if-no-files-found: error
+          compression-level: 6
+          retention-days: 30

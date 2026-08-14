@@ -45,6 +45,7 @@
 #include "Core/PowerPC/JitInterface.h"
 #include "Core/PowerPC/MMU.h"
 #include "Core/PowerPC/PPCAnalyst.h"
+#include "Core/RE4RNGTrace.h"
 #include "Core/PowerPC/PowerPC.h"
 #include "Core/System.h"
 
@@ -1066,6 +1067,21 @@ bool Jit64::DoJit(u32 em_address, JitBlock* b, u32 nextPC)
 
     if (HandleFunctionHooking(op.address))
       break;
+
+    const bool is_re4_rng = op.address == Core::RE4RNGTrace::RNG_FUNCTION_ADDRESS;
+    const bool is_re4_drop_probe = Core::RE4RNGTrace::IsDropProbeAddress(op.address);
+    if (is_re4_rng || is_re4_drop_probe)
+    {
+      gpr.Flush();
+      fpr.Flush();
+
+      ABI_PushRegistersAndAdjustStack({}, 0);
+      if (is_re4_rng)
+        ABI_CallFunctionP(Core::RE4RNGTrace::OnRNGFunctionEntry, &m_system);
+      if (is_re4_drop_probe)
+        ABI_CallFunctionPC(Core::RE4RNGTrace::OnDropProbeEntry, &m_system, op.address);
+      ABI_PopRegistersAndAdjustStack({}, 0);
+    }
 
     if (op.skip)
     {

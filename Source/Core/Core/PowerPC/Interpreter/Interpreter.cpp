@@ -22,6 +22,7 @@
 #include "Core/PowerPC/MMU.h"
 #include "Core/PowerPC/PPCTables.h"
 #include "Core/PowerPC/PowerPC.h"
+#include "Core/RE4RNGTrace.h"
 #include "Core/System.h"
 
 namespace
@@ -117,6 +118,11 @@ bool Interpreter::HandleFunctionHooking(u32 address)
 
 int Interpreter::SingleStepInner()
 {
+  if (m_ppc_state.pc == Core::RE4RNGTrace::RNG_FUNCTION_ADDRESS)
+    Core::RE4RNGTrace::OnRNGFunctionEntry(&m_system);
+  if (Core::RE4RNGTrace::IsDropProbeAddress(m_ppc_state.pc))
+    Core::RE4RNGTrace::OnDropProbeEntry(&m_system, m_ppc_state.pc);
+
   if (HandleFunctionHooking(m_ppc_state.pc))
   {
     UpdatePC();

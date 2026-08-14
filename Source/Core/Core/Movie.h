@@ -183,6 +183,7 @@ public:
   u64 GetTotalInputCount() const;
   u64 GetCurrentLagCount() const;
   u64 GetTotalLagCount() const;
+  const std::string& GetCurrentMoviePath() const;
 
   void SetClearSave(bool enabled);
   void SignalDiscChange(const std::string& new_path);
@@ -267,6 +268,7 @@ private:
   bool m_polled = false;
 
   std::string m_current_file_name;
+  std::string m_current_movie_path;
 
   // m_input_display is used by both CPU and GPU (is mutable).
   std::mutex m_input_display_lock;

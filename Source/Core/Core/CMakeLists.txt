@@ -500,6 +500,10 @@ add_library(core
   MemTools.h
   Movie.cpp
   Movie.h
+  RE4RNGSearch.cpp
+  RE4RNGSearch.h
+  RE4RNGTrace.cpp
+  RE4RNGTrace.h
   NetPlayClient.cpp
   NetPlayClient.h
   NetPlayCommon.cpp

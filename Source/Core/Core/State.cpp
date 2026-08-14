@@ -258,6 +258,22 @@ static std::size_t SaveToBuffer(Core::System& system, Common::UniqueBuffer<u8>& 
   return 0;
 }
 
+std::vector<u8> SaveToMemory(Core::System& system)
+{
+  const std::size_t estimate = static_cast<std::size_t>(s_last_state_size) * 110 / 100;
+  Common::UniqueBuffer<u8> buffer{estimate};
+  const std::size_t actual_size = SaveToBuffer(system, buffer);
+  if (actual_size == 0)
+    return {};
+
+  return {buffer.data(), buffer.data() + actual_size};
+}
+
+bool LoadFromMemory(Core::System& system, std::span<u8> buffer)
+{
+  return !buffer.empty() && LoadFromBuffer(system, buffer);
+}
+
 namespace
 {
 struct SlotWithTimestamp

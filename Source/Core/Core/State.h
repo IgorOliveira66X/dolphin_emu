@@ -7,7 +7,9 @@
 
 #include <cstddef>
 #include <functional>
+#include <span>
 #include <string>
+#include <vector>
 #include <type_traits>
 
 #include "Common/CommonTypes.h"
@@ -97,6 +99,11 @@ void Load(Core::System& system, u32 slot);
 
 void SaveAs(Core::System& system, std::string filename);
 void LoadAs(Core::System& system, std::string filename);
+
+// Lightweight uncompressed snapshots for deterministic internal search/benchmark tools.
+// These must be called on the CPU thread.
+std::vector<u8> SaveToMemory(Core::System& system);
+bool LoadFromMemory(Core::System& system, std::span<u8> buffer);
 
 void LoadLastSaved(Core::System& system, int i = 1);
 void SaveFirstSaved(Core::System& system);

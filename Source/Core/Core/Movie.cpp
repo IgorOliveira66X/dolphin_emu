@@ -58,6 +58,8 @@
 #include "Core/IOS/USB/Bluetooth/BTEmu.h"
 #include "Core/IOS/USB/Bluetooth/WiimoteDevice.h"
 #include "Core/NetPlayProto.h"
+#include "Core/RE4RNGSearch.h"
+#include "Core/RE4RNGTrace.h"
 #include "Core/State.h"
 #include "Core/System.h"
 #include "Core/WiiUtils.h"
@@ -190,6 +192,8 @@ void MovieManager::FrameUpdate()
 // NOTE: EmuThread
 void MovieManager::Init(const BootParameters& boot)
 {
+  Core::RE4RNGTrace::ResetSession();
+
   if (std::holds_alternative<BootParameters::Disc>(boot.parameters))
     m_current_file_name = std::get<BootParameters::Disc>(boot.parameters).path;
   else
@@ -331,6 +335,11 @@ u64 MovieManager::GetCurrentLagCount() const
 u64 MovieManager::GetTotalLagCount() const
 {
   return m_total_lag_count;
+}
+
+const std::string& MovieManager::GetCurrentMoviePath() const
+{
+  return m_current_movie_path;
 }
 
 void MovieManager::SetClearSave(bool enabled)
@@ -765,6 +774,9 @@ void MovieManager::CheckPadStatus(const GCPadStatus* PadStatus, int controllerID
   m_pad_state.reset = m_reset;
   m_reset = false;
 
+  Core::RE4RNGTrace::OnPadStatus(*PadStatus, controllerID, m_current_frame,
+                                 m_current_input_count + 1);
+
   {
     std::string display_str = GenerateInputDisplayString(m_pad_state, controllerID);
 
@@ -886,6 +898,7 @@ bool MovieManager::PlayInput(const std::string& movie_path,
   m_current_input_count = 0;
 
   m_play_mode = PlayMode::Playing;
+  m_current_movie_path = movie_path;
 
   // Wiimotes cause desync issues if they're not reset before launching the game
   ::Wiimote::ResetAllWiimotes();
@@ -1132,6 +1145,7 @@ void MovieManager::PlayController(GCPadStatus* PadStatus, int controllerID)
   }
 
   memcpy(&m_pad_state, &m_temp_input[m_current_byte], sizeof(ControllerState));
+  Core::RE4RNGSearch::MutateMovieControllerState(m_current_frame, m_current_byte, m_pad_state);
   m_current_byte += sizeof(ControllerState);
 
   PadStatus->isConnected = m_pad_state.is_connected;
@@ -1196,6 +1210,9 @@ void MovieManager::PlayController(GCPadStatus* PadStatus, int controllerID)
 
   if (m_pad_state.reset)
     m_system.GetProcessorInterface().ResetButton_Tap();
+
+  Core::RE4RNGTrace::OnPadStatus(*PadStatus, controllerID, m_current_frame,
+                                 m_current_input_count + 1);
 
   {
     std::string display_str = GenerateInputDisplayString(m_pad_state, controllerID);
