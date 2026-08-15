@@ -1,16 +1,27 @@
-RE4 JPN GENERIC DROP SEARCH v7.1
+RE4 JPN GENERIC DROP SEARCH v7.2
 ==================================
 
 WHAT CHANGED
 ------------
-v7.1 is one configurable search engine instead of a patch tied to one drop scene. It supports
+v7.2 is one configurable search engine instead of a patch tied to one drop scene. It supports
 1 through 10 simultaneous drops, order-independent or per-slot targets, calibrated controller
 mutations, separate grenade/money/target corpora, adaptive-difficulty logging, and automatic
 generation of the winning DTM.
 
-v7.1 fixes the initial v7 profile failing silently because a semicolon comment containing '='
+v7.1 fixed the initial v7 profile failing silently because a semicolon comment containing '='
 was interpreted as a Catalog entry. The loader now ignores semicolon comments in Catalog, the
 bundled INI uses Dolphin-compatible '#' comments, and search status has its own HUD line.
+
+v7.2 fixes result files failing silently on Windows paths that require Unicode handling. CSV,
+summary, and FOUND text files now use Dolphin's native path-aware stream helper. If User/Logs is
+not writable, the searcher automatically falls back to RE4DropSearchResults beside Dolphin.exe.
+The search stops with a visible OUTPUT ERROR if neither location works, and the HUD shows the
+active worker plus the exact CSV path. It also writes RE4DropSearchOutput_wN.txt beside Dolphin.exe
+so the output location can be opened without guessing.
+
+For TAS safety, v7.2 refuses to start attempts while Dolphin's emulated CPU clock override or VBI
+overclock is enabled. Host CPU/GPU overclocking does not change the emulated timing and is outside
+this check.
 
 CURRENT BUNDLED PROFILE
 -----------------------
@@ -29,7 +40,9 @@ USAGE
 1. Extract the entire archive to a new folder. Keep RE4DropSearch.ini beside Dolphin.exe.
 2. Open Dolphin.exe and play re4-wr-tas1.dtm read-only using the same RE4 JPN setup.
 3. The HUD first reports validation and a short calibration, then phase 2 adaptive search.
-4. A success pauses emulation and writes these files under User/Logs:
+4. At search start, the HUD displays the exact CSV output path. The primary directory is
+   User/Logs; the automatic fallback is RE4DropSearchResults beside Dolphin.exe.
+5. A success pauses emulation and writes these files in that output directory:
 
      re4_jpn_village_dual_v7_FOUND.dtm
      re4_jpn_village_dual_v7_FOUND.txt

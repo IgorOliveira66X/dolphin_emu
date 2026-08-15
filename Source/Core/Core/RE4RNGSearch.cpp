@@ -7,6 +7,7 @@
 #include <array>
 #include <atomic>
 #include <bit>
+#include <cerrno>
 #include <chrono>
 #include <cctype>
 #include <cstdlib>
@@ -253,6 +254,9 @@ struct SearchState
   std::string config_path;
   std::string config_error;
   std::string validation_error;
+  std::string output_directory;
+  std::string results_path;
+  std::string output_error;
   std::string found_dtm_path;
   std::chrono::steady_clock::time_point search_start{};
   std::chrono::steady_clock::time_point attempt_start{};
@@ -1129,11 +1133,29 @@ std::string WorkerSuffix()
   return s_state.config.worker_count > 1 ? fmt::format("_w{}", s_state.config.worker_id) : "";
 }
 
+std::string WorkerDescription()
+{
+  return fmt::format("w{}/{}", s_state.config.worker_id, s_state.config.worker_count);
+}
+
+std::string OutputFilename(std::string_view suffix)
+{
+  return s_state.config.output_prefix + WorkerSuffix() + std::string(suffix);
+}
+
+std::string OutputPathForDirectory(std::string_view directory, std::string_view suffix)
+{
+  std::string path{directory};
+  if (!path.empty() && path.back() != '/' && path.back() != '\\')
+    path += DIR_SEP;
+  return path + OutputFilename(suffix);
+}
+
 std::string OutputPath(std::string_view suffix)
 {
-  File::CreateFullPath(File::GetUserPath(D_LOGS_IDX));
-  return File::GetUserPath(D_LOGS_IDX) + s_state.config.output_prefix + WorkerSuffix() +
-         std::string(suffix);
+  const std::string& directory =
+      s_state.output_directory.empty() ? File::GetUserPath(D_LOGS_IDX) : s_state.output_directory;
+  return OutputPathForDirectory(directory, suffix);
 }
 
 std::string TargetDescription()
@@ -1148,11 +1170,30 @@ std::string TargetDescription()
   return description;
 }
 
-void OpenResultsLocked()
+bool TryOpenResultsLocked(const std::string& directory)
 {
-  s_state.results = std::ofstream(OutputPath("_results.csv"), std::ios::out | std::ios::trunc);
+  const std::string path = OutputPathForDirectory(directory, "_results.csv");
+  if (!File::CreateFullPath(path))
+  {
+    s_state.output_error += fmt::format("cannot create directory for '{}'; ", path);
+    return false;
+  }
+
+  s_state.results.close();
+  s_state.results.clear();
+  errno = 0;
+  File::OpenFStream(s_state.results, path, std::ios::out | std::ios::trunc);
   if (!s_state.results)
-    return;
+  {
+    const int open_error = errno;
+    const std::string reason =
+        open_error == 0 ? "" : fmt::format(" ({})", std::strerror(open_error));
+    s_state.output_error += fmt::format("cannot open '{}'{}; ", path, reason);
+    return false;
+  }
+
+  s_state.output_directory = directory;
+  s_state.results_path = path;
   s_state.results.imbue(std::locale::classic());
   s_state.results << "attempt,phase,plan,parent,movement_cost_frames,mutations,completed_drops,";
   for (size_t i = 0; i < EventCapacity(); ++i)
@@ -1167,6 +1208,34 @@ void OpenResultsLocked()
   s_state.results << "matched_targets,target,fitness,grenade_route,money_route,novel_signature,"
                      "corpus_size,adaptive_points,adaptive_rank,status,elapsed_ms\n";
   s_state.results.flush();
+  if (!s_state.results)
+  {
+    s_state.output_error += fmt::format("cannot write header to '{}'; ", path);
+    s_state.results.close();
+    s_state.output_directory.clear();
+    s_state.results_path.clear();
+    return false;
+  }
+  return true;
+}
+
+bool OpenResultsLocked()
+{
+  s_state.output_error.clear();
+  const bool opened = TryOpenResultsLocked(File::GetUserPath(D_LOGS_IDX)) ||
+                      TryOpenResultsLocked(File::GetExeDirectory() + DIR_SEP +
+                                           "RE4DropSearchResults" + DIR_SEP);
+  if (!opened)
+    return false;
+
+  const std::string locator_path =
+      File::GetExeDirectory() + DIR_SEP + "RE4DropSearchOutput" + WorkerSuffix() + ".txt";
+  const std::string locator =
+      fmt::format("RE4 JPN DROP SEARCH v7.2\nWorker: {}\nResults CSV: {}\n",
+                  WorkerDescription(), s_state.results_path);
+  if (!File::WriteStringToFile(locator_path, locator))
+    s_state.output_error += fmt::format("cannot write output locator '{}'; ", locator_path);
+  return true;
 }
 
 void WriteEventCSV(std::ostream& out, const DropEvent& event)
@@ -1233,13 +1302,15 @@ bool WriteWinningDTMLocked(System* system)
 
 void WriteFoundLocked(bool dtm_written)
 {
-  std::ofstream out(OutputPath("_FOUND.txt"), std::ios::out | std::ios::trunc);
+  std::ofstream out;
+  File::OpenFStream(out, OutputPath("_FOUND.txt"), std::ios::out | std::ios::trunc);
   if (!out)
     return;
   out.imbue(std::locale::classic());
   out << "RE4 JPN GENERIC DROP TARGET FOUND\n";
-  out << "Searcher: v7.1 generic profile engine\n";
+  out << "Searcher: v7.2 generic profile engine\n";
   out << fmt::format("Profile: {}\n", s_state.config.profile);
+  out << fmt::format("Worker: {}\n", WorkerDescription());
   out << fmt::format("Target mode: {}\n", TargetModeName(s_state.config.target_mode));
   out << fmt::format("Target: {}\n", TargetDescription());
   out << fmt::format("Attempt: {}\n", s_state.attempts);
@@ -1271,14 +1342,20 @@ void WriteFoundLocked(bool dtm_written)
 
 void WriteSummaryLocked(std::string_view status)
 {
-  std::ofstream out(OutputPath("_summary.txt"), std::ios::out | std::ios::trunc);
+  std::ofstream out;
+  File::OpenFStream(out, OutputPath("_summary.txt"), std::ios::out | std::ios::trunc);
   if (!out)
     return;
   out.imbue(std::locale::classic());
-  out << "RE4 JPN GENERIC DROP SEARCH v7.1 SUMMARY\n";
+  out << "RE4 JPN GENERIC DROP SEARCH v7.2 SUMMARY\n";
   out << fmt::format("Status: {}\n", status);
   out << fmt::format("Profile: {}\n", s_state.config.profile);
+  out << fmt::format("Worker: {}\n", WorkerDescription());
   out << fmt::format("Config: {}\n", s_state.config_path);
+  out << fmt::format("Output directory: {}\n", s_state.output_directory);
+  out << fmt::format("Results CSV: {}\n", s_state.results_path);
+  if (!s_state.output_error.empty())
+    out << fmt::format("Output fallback diagnostics: {}\n", s_state.output_error);
   if (!s_state.config_error.empty())
     out << fmt::format("Config error: {}\n", s_state.config_error);
   if (!s_state.validation_error.empty())
@@ -1723,8 +1800,9 @@ void FinishCalibrationLocked()
   s_state.calibration_done = true;
   OSD::AddTypedMessage(
       OSD::MessageType::RE4DropSearch,
-      fmt::format("RE4 v7.1 calibration DONE | {} kinds | {} active slots",
-                  s_state.effective_kinds.size(), s_state.effective_slots.size()),
+      fmt::format("RE4 v7.2 calibration DONE | {} | {} kinds | {} active slots",
+                  WorkerDescription(), s_state.effective_kinds.size(),
+                  s_state.effective_slots.size()),
       OSD::Duration::VERY_LONG, OSD::Color::GREEN);
 }
 
@@ -1788,8 +1866,8 @@ bool PrepareNextPlanLocked()
     s_state.validation_done = true;
     OSD::AddTypedMessage(
         OSD::MessageType::RE4DropSearch,
-        fmt::format("RE4 v7.1 validation PASSED | {} drops | window {}-{}",
-                    s_state.validation_outcomes[0].completed_count,
+        fmt::format("RE4 v7.2 validation PASSED | {} | {} drops | window {}-{}",
+                    WorkerDescription(), s_state.validation_outcomes[0].completed_count,
                     s_state.config.window_first, s_state.effective_window_last),
         OSD::Duration::VERY_LONG, OSD::Color::GREEN);
     BuildCalibrationQueueLocked();
@@ -1820,7 +1898,8 @@ void FinishSearchLocked(System* system, std::string_view message, u32 color)
   Config::SetCurrent(Config::MAIN_EMULATION_SPEED, s_state.previous_speed);
   if (s_state.results)
     s_state.results.flush();
-  WriteSummaryLocked(message);
+  if (!s_state.output_directory.empty())
+    WriteSummaryLocked(message);
   OSD::AddTypedMessage(OSD::MessageType::RE4DropSearch, std::string(message),
                        OSD::Duration::VERY_LONG, color);
   if (system)
@@ -1840,6 +1919,16 @@ void CaptureOnCPUThread(System* system)
 {
   {
     std::lock_guard lock{s_mutex};
+    if (Config::Get(Config::MAIN_OVERCLOCK_ENABLE) ||
+        Config::Get(Config::MAIN_VI_OVERCLOCK_ENABLE))
+    {
+      s_state.previous_speed = Config::Get(Config::MAIN_EMULATION_SPEED);
+      s_state.validation_error = "emulated CPU/VBI overclock is enabled";
+      FinishSearchLocked(system, "RE4 v7.2 FAILED: disable emulated CPU/VBI overclock",
+                         OSD::Color::RED);
+      return;
+    }
+
     const auto& movie = system->GetMovie();
     if (!movie.IsPlayingInput() || !MovieMatchesConfig(movie))
     {
@@ -1848,7 +1937,7 @@ void CaptureOnCPUThread(System* system)
           "wrong DTM (got {} frames / {} inputs; expected {} / {})", movie.GetTotalFrames(),
           movie.GetTotalInputCount(), s_state.config.expected_movie_frames,
           s_state.config.expected_movie_inputs);
-      FinishSearchLocked(system, "RE4 v7.1 FAILED: DTM does not match the active profile",
+      FinishSearchLocked(system, "RE4 v7.2 FAILED: DTM does not match the active profile",
                          OSD::Color::RED);
       return;
     }
@@ -1859,7 +1948,7 @@ void CaptureOnCPUThread(System* system)
     std::lock_guard lock{s_mutex};
     if (snapshot.empty())
     {
-      FinishSearchLocked(system, "RE4 v7.1 FAILED: in-memory snapshot error", OSD::Color::RED);
+      FinishSearchLocked(system, "RE4 v7.2 FAILED: in-memory snapshot error", OSD::Color::RED);
       return;
     }
     s_state.snapshot = std::move(snapshot);
@@ -1868,20 +1957,33 @@ void CaptureOnCPUThread(System* system)
     s_state.previous_speed = Config::Get(Config::MAIN_EMULATION_SPEED);
     Config::SetCurrent(Config::MAIN_EMULATION_SPEED, 0.0f);
     s_suppress_trace.store(true, std::memory_order_release);
-    OpenResultsLocked();
+    if (!OpenResultsLocked())
+    {
+      FinishSearchLocked(
+          system,
+          fmt::format("RE4 v7.2 OUTPUT ERROR | {} | {}", WorkerDescription(),
+                      s_state.output_error),
+          OSD::Color::RED);
+      return;
+    }
     BuildValidationQueueLocked();
     s_state.search_start = std::chrono::steady_clock::now();
     if (!PrepareNextPlanLocked())
     {
-      FinishSearchLocked(system, "RE4 v7.1 FAILED: could not prepare validation",
+      FinishSearchLocked(system, "RE4 v7.2 FAILED: could not prepare validation",
                          OSD::Color::RED);
       return;
     }
     OSD::AddTypedMessage(
         OSD::MessageType::RE4DropSearch,
-        fmt::format("RE4 DROP SEARCH v7.1 START | {} | F{} | budget {}", s_state.config.profile,
-                    s_state.config.capture_frame, s_state.config.budget),
+        fmt::format("RE4 DROP SEARCH v7.2 START | {} | {} | F{} | budget {}",
+                    WorkerDescription(), s_state.config.profile, s_state.config.capture_frame,
+                    s_state.config.budget),
         OSD::Duration::VERY_LONG, OSD::Color::GREEN);
+    OSD::AddTypedMessage(
+        OSD::MessageType::RE4DropSearchOutput,
+        fmt::format("RE4 v7.2 OUTPUT | {} | {}", WorkerDescription(), s_state.results_path),
+        OSD::Duration::VERY_LONG, OSD::Color::CYAN);
   }
   system->GetCPU().Continue();
 }
@@ -1899,7 +2001,7 @@ void RestoreOnCPUThread(System* system)
     s_state.restore_requested = false;
     if (!restored)
     {
-      FinishSearchLocked(system, "RE4 v7.1 FAILED: in-memory restore error", OSD::Color::RED);
+      FinishSearchLocked(system, "RE4 v7.2 FAILED: in-memory restore error", OSD::Color::RED);
       return;
     }
     if (!PrepareNextPlanLocked())
@@ -1907,16 +2009,16 @@ void RestoreOnCPUThread(System* system)
       if (!s_state.validation_done)
       {
         FinishSearchLocked(system,
-                           fmt::format("RE4 v7.1 validation FAILED | {}",
-                                       s_state.validation_error),
+                           fmt::format("RE4 v7.2 validation FAILED | {} | {}",
+                                       WorkerDescription(), s_state.validation_error),
                            OSD::Color::RED);
       }
       else
       {
         FinishSearchLocked(
             system,
-            fmt::format("RE4 v7.1 DONE | {} attempts | {} signatures", s_state.attempts,
-                        s_state.seen_signatures.size()),
+            fmt::format("RE4 v7.2 DONE | {} | {} attempts | {} signatures",
+                        WorkerDescription(), s_state.attempts, s_state.seen_signatures.size()),
             OSD::Color::YELLOW);
       }
       return;
@@ -1985,15 +2087,15 @@ void CompleteAttempt(System* system, std::string status)
     if (new_grenade_route && s_state.route_corpus.size() <= 20)
     {
       OSD::AddTypedMessage(OSD::MessageType::RE4DropSearch,
-                           fmt::format("RE4 v7.1 GRENADE ROUTE | attempt {} | parents {}", attempts,
-                                       s_state.route_corpus.size()),
+                           fmt::format("RE4 v7.2 GRENADE ROUTE | {} | attempt {} | parents {}",
+                                       WorkerDescription(), attempts, s_state.route_corpus.size()),
                            OSD::Duration::VERY_LONG, OSD::Color::GREEN);
     }
     else if (new_money_route && s_state.money_corpus.size() <= 20)
     {
       OSD::AddTypedMessage(OSD::MessageType::RE4DropSearch,
-                           fmt::format("RE4 v7.1 MONEY ROUTE | attempt {} | parents {}", attempts,
-                                       s_state.money_corpus.size()),
+                           fmt::format("RE4 v7.2 MONEY ROUTE | {} | attempt {} | parents {}",
+                                       WorkerDescription(), attempts, s_state.money_corpus.size()),
                            OSD::Duration::VERY_LONG, OSD::Color::CYAN);
     }
 
@@ -2001,11 +2103,12 @@ void CompleteAttempt(System* system, std::string status)
     {
       OSD::AddTypedMessage(
           OSD::MessageType::RE4DropSearch,
-          fmt::format("RE4 v7.1 | {} | {:.2f}/s | phase {} | cost {}/{} | corpus {} | G {} | P {}",
-                      attempts, rate, s_state.current_plan.phase,
-                      s_state.current_plan.movement_cost_frames,
-                      s_state.config.max_movement_cost_frames, s_state.corpus.size(),
-                      s_state.route_corpus.size(), s_state.money_corpus.size()),
+          fmt::format(
+              "RE4 v7.2 | {} | {} | {:.2f}/s | phase {} | cost {}/{} | corpus {} | G {} | P {}",
+              WorkerDescription(), attempts, rate, s_state.current_plan.phase,
+              s_state.current_plan.movement_cost_frames,
+              s_state.config.max_movement_cost_frames, s_state.corpus.size(),
+              s_state.route_corpus.size(), s_state.money_corpus.size()),
           OSD::Duration::VERY_LONG, OSD::Color::CYAN);
     }
   }
@@ -2014,8 +2117,9 @@ void CompleteAttempt(System* system, std::string status)
   {
     std::lock_guard lock{s_mutex};
     FinishSearchLocked(system,
-                       fmt::format("RE4 v7.1 TARGET FOUND | attempt {} | DTM {} | {}", attempts,
-                                   dtm_written ? "OK" : "ERROR", found_plan),
+                       fmt::format("RE4 v7.2 TARGET FOUND | {} | attempt {} | DTM {} | {}",
+                                   WorkerDescription(), attempts, dtm_written ? "OK" : "ERROR",
+                                   found_plan),
                        OSD::Color::GREEN);
     return;
   }
@@ -2062,20 +2166,21 @@ void ResetSession()
   if (!loaded)
   {
     OSD::AddTypedMessage(OSD::MessageType::RE4DropSearch,
-                         fmt::format("RE4 v7.1 CONFIG ERROR | {}", s_state.config_error),
+                         fmt::format("RE4 v7.2 CONFIG ERROR | {}", s_state.config_error),
                          OSD::Duration::VERY_LONG, OSD::Color::RED);
     return;
   }
   if (!s_state.config.enabled)
   {
-    OSD::AddTypedMessage(OSD::MessageType::RE4DropSearch, "RE4 drop search v7.1 disabled in INI",
+    OSD::AddTypedMessage(OSD::MessageType::RE4DropSearch, "RE4 drop search v7.2 disabled in INI",
                          OSD::Duration::NORMAL, OSD::Color::YELLOW);
     return;
   }
   OSD::AddTypedMessage(
       OSD::MessageType::RE4DropSearch,
-      fmt::format("RE4 drop search v7.1 armed | {} | {} drops | target {}",
-                  s_state.config.profile, s_state.config.expected_drops, TargetDescription()),
+      fmt::format("RE4 drop search v7.2 armed | {} | {} | {} drops | target {}",
+                  WorkerDescription(), s_state.config.profile, s_state.config.expected_drops,
+                  TargetDescription()),
       OSD::Duration::VERY_LONG, OSD::Color::GREEN);
 }
 

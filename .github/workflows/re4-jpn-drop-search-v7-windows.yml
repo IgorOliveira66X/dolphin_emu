@@ -1,4 +1,4 @@
-name: RE4 JPN Generic Drop Search v7.1 Windows Build
+name: RE4 JPN Generic Drop Search v7.2 Windows Build
 
 on:
   workflow_dispatch:
@@ -10,6 +10,7 @@ on:
       - Source/Core/Core/Movie.h
       - Source/Core/Core/RE4RNGSearch.cpp
       - Source/Core/Core/RE4RNGSearch.h
+      - Source/Core/VideoCommon/OnScreenDisplay.h
       - RE4DropSearch.ini
       - RE4_DROP_SEARCH_V7_README.txt
       - .github/workflows/re4-jpn-drop-search-v7-windows.yml
@@ -51,7 +52,7 @@ jobs:
       - name: Upload portable Dolphin build
         uses: actions/upload-artifact@v4
         with:
-          name: Dolphin-RE4-JPN-Generic-Drop-Search-v7.1-Windows-x64
+          name: Dolphin-RE4-JPN-Generic-Drop-Search-v7.2-Windows-x64
           path: build/release/x64/Binaries/**
           if-no-files-found: error
           compression-level: 6

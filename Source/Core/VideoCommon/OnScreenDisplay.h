@@ -20,6 +20,7 @@ enum class MessageType
   NetPlayBuffer,
   RE4RNGTrace,
   RE4DropSearch,
+  RE4DropSearchOutput,
 
   // This entry must be kept last so that persistent typed messages are
   // displayed before other messages
