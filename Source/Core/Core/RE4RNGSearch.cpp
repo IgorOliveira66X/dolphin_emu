@@ -61,7 +61,7 @@ constexpr u32 PTAS_ITEM_ID = 0x78;
 constexpr size_t MAX_DROPS = 10;
 constexpr size_t MAX_CORPUS_ENTRIES = 8192;
 constexpr size_t MAX_FOCUSED_ENTRIES = 4096;
-constexpr u64 DEFAULT_FUZZ_SEED = 0x5245345F56375F31ULL;
+constexpr u64 DEFAULT_FUZZ_SEED = 0x5245345F56385F31ULL;
 constexpr std::string_view CONFIG_FILENAME = "RE4DropSearch.ini";
 
 enum class MutationKind : u8
@@ -116,25 +116,27 @@ struct TargetSpec
 struct SearchConfig
 {
   bool enabled = true;
-  std::string profile = "Village dual drop - Hand + 9900";
-  std::string output_prefix = "re4_jpn_village_dual_v7";
-  u64 expected_movie_frames = 8089;
-  u64 expected_movie_inputs = 16173;
-  u64 capture_frame = 7823;
-  u64 window_first = 7826;
+  std::string profile = "Village dual route scout - window 7805";
+  std::string output_prefix = "re4_jpn_village_dual_v8_scout";
+  u64 expected_movie_frames = 8106;
+  u64 expected_movie_inputs = 16207;
+  u64 capture_frame = 7803;
+  u64 window_first = 7806;
   u64 window_max = 8032;
-  u64 movement_first = 7825;
-  u64 movement_last = 7953;
-  u64 hard_end_frame = 8070;
-  u64 budget = 200000;
+  u64 movement_first = 7805;
+  u64 movement_last = 8032;
+  u64 hard_end_frame = 8088;
+  u64 budget = 20000;
   u32 expected_drops = 2;
   u32 max_movement_cost_frames = 4;
   u32 max_plan_mutations = 12;
   u32 max_hold_slots = 6;
-  u32 calibration_anchors = 9;
-  bool full_calibration = false;
+  u32 calibration_anchors = 15;
+  u32 fresh_plan_percent = 35;
+  bool full_calibration = true;
   u32 worker_id = 0;
   u32 worker_count = 1;
+  bool partition_workers = true;
   u64 fuzz_seed = DEFAULT_FUZZ_SEED;
   u32 hand_grenade_id = 1;
   std::map<std::string, u32> grenade_aliases{{"HAND", 1}};
@@ -145,6 +147,12 @@ struct SearchConfig
   std::vector<MutationKind> allowed_kinds;
   std::set<MutationKind> forced_kinds;
   std::vector<u64> hotspots;
+  bool scout_enabled = true;
+  bool scout_stop_on_first = true;
+  u32 scout_min_money_probe_stage = 2;
+  std::set<u16> scout_known_route_seeds{0xBE9D};
+  std::set<u32> scout_known_grenade_ids{2};
+  std::set<u32> scout_known_money_units{70, 80, 90, 100, 110, 120, 130, 140};
 };
 
 struct Mutation
@@ -198,13 +206,21 @@ struct Outcome
   size_t completed_count = 0;
   bool overflow = false;
   bool target = false;
+  bool scout_breakthrough = false;
   bool novel_signature = false;
+  bool novel_gate_seed = false;
+  bool novel_route_seed = false;
+  bool novel_grenade_id = false;
+  bool novel_money_value = false;
   bool has_grenade_route = false;
   bool has_money_route = false;
+  u32 max_money_probe_stage = 0;
   u32 matched_targets = 0;
   u64 fitness = 0;
+  u64 coverage_score = 0;
   u32 difficulty_points = 0;
   u8 difficulty_rank = 0;
+  std::string scout_reason;
   std::string status = "ok";
 };
 
@@ -551,6 +567,9 @@ bool LoadConfig(SearchConfig* config, std::string* path, std::string* error)
       !GetIniU32(ini, "Mutations", "MaxPlanMutations", &config->max_plan_mutations, error) ||
       !GetIniU32(ini, "Mutations", "MaxHoldSlots", &config->max_hold_slots, error) ||
       !GetIniU32(ini, "Mutations", "CalibrationAnchors", &config->calibration_anchors, error) ||
+      !GetIniU32(ini, "Mutations", "FreshPlanPercent", &config->fresh_plan_percent, error) ||
+      !GetIniU32(ini, "Scout", "MinimumMoneyProbeStage",
+                 &config->scout_min_money_probe_stage, error) ||
       !GetIniU32(ini, "Memory", "AdaptivePointsAddress",
                  &config->adaptive_points_address, error) ||
       !GetIniU32(ini, "Memory", "AdaptiveRankAddress", &config->adaptive_rank_address, error))
@@ -558,6 +577,9 @@ bool LoadConfig(SearchConfig* config, std::string* path, std::string* error)
     return false;
   }
   GetIniValue(ini, "Mutations", "FullCalibration", &config->full_calibration);
+  GetIniValue(ini, "Search", "PartitionWorkers", &config->partition_workers);
+  GetIniValue(ini, "Scout", "Enabled", &config->scout_enabled);
+  GetIniValue(ini, "Scout", "StopOnFirstBreakthrough", &config->scout_stop_on_first);
 
   config->grenade_aliases.clear();
   if (const Common::IniFile::Section* const catalog = ini.GetSection("Catalog"))
@@ -667,6 +689,55 @@ bool LoadConfig(SearchConfig* config, std::string* path, std::string* error)
     config->hotspots.push_back(*slot);
   }
 
+  std::string known_route_seeds;
+  if (GetIniString(ini, "Scout", "KnownRouteSeeds", &known_route_seeds))
+  {
+    config->scout_known_route_seeds.clear();
+    for (const std::string& token : SplitList(known_route_seeds))
+    {
+      const std::optional<u64> value = ParseU64(token);
+      if (!value || *value > std::numeric_limits<u16>::max())
+      {
+        *error = fmt::format("invalid scout route seed '{}'", token);
+        return false;
+      }
+      config->scout_known_route_seeds.insert(static_cast<u16>(*value));
+    }
+  }
+
+  std::string known_grenade_ids;
+  if (GetIniString(ini, "Scout", "KnownGrenadeIds", &known_grenade_ids))
+  {
+    config->scout_known_grenade_ids.clear();
+    for (const std::string& token : SplitList(known_grenade_ids))
+    {
+      const std::optional<u64> value = ParseU64(token);
+      if (!value || *value > std::numeric_limits<u32>::max())
+      {
+        *error = fmt::format("invalid scout grenade ID '{}'", token);
+        return false;
+      }
+      config->scout_known_grenade_ids.insert(static_cast<u32>(*value));
+    }
+  }
+
+  std::string known_money_amounts;
+  if (GetIniString(ini, "Scout", "KnownMoneyAmounts", &known_money_amounts))
+  {
+    config->scout_known_money_units.clear();
+    for (const std::string& token : SplitList(known_money_amounts))
+    {
+      const std::optional<u64> amount = ParseU64(token);
+      if (!amount || (*amount % 10) != 0 ||
+          *amount > static_cast<u64>(std::numeric_limits<u32>::max()) * 10)
+      {
+        *error = fmt::format("invalid scout money amount '{}'", token);
+        return false;
+      }
+      config->scout_known_money_units.insert(static_cast<u32>(*amount / 10));
+    }
+  }
+
   if (!config->enabled)
     return true;
   if (config->targets.empty())
@@ -699,6 +770,10 @@ bool LoadConfig(SearchConfig* config, std::string* path, std::string* error)
     *error = "MaxHoldSlots must be 1..32";
   else if (config->calibration_anchors == 0 || config->calibration_anchors > 128)
     *error = "CalibrationAnchors must be 1..128";
+  else if (config->fresh_plan_percent > 100)
+    *error = "FreshPlanPercent must be 0..100";
+  else if (config->scout_min_money_probe_stage > MONEY_PROBE_PCS.size())
+    *error = "MinimumMoneyProbeStage must be 0..3";
 
   if (!error->empty())
     return false;
@@ -848,16 +923,78 @@ u64 TargetCloseness(const DropEvent& event, const TargetSpec& target)
   return score;
 }
 
+u32 MoneyProbeStage(const DropEvent& event)
+{
+  u32 stage = 0;
+  for (size_t i = 0; i < event.money_probes.size(); ++i)
+  {
+    if (event.money_probes[i].seen)
+      stage = static_cast<u32>(i + 1);
+  }
+  return stage;
+}
+
+void UpdateScoutOutcome(Outcome& outcome)
+{
+  outcome.scout_breakthrough = false;
+  outcome.scout_reason.clear();
+  if (!s_state.config.scout_enabled)
+    return;
+
+  std::set<std::string> reasons;
+  for (const DropEvent& event : outcome.events)
+  {
+    if (event.route_seen &&
+        !s_state.config.scout_known_route_seeds.contains(event.route_seed))
+    {
+      reasons.insert(fmt::format("ROUTE_{:04X}", event.route_seed));
+    }
+    if (IsGrenade(event) &&
+        !s_state.config.scout_known_grenade_ids.contains(event.grenade_id))
+    {
+      reasons.insert(fmt::format("GRENADE_ID_{}", event.grenade_id));
+    }
+    const u32 probe_stage = MoneyProbeStage(event);
+    if (s_state.config.scout_min_money_probe_stage != 0 &&
+        probe_stage >= s_state.config.scout_min_money_probe_stage)
+    {
+      reasons.insert(fmt::format("MONEY_PROBE_{}", probe_stage));
+    }
+    if (IsMoney(event) &&
+        !s_state.config.scout_known_money_units.contains(event.late_r29))
+    {
+      reasons.insert(fmt::format("PTAS_{}", static_cast<u64>(event.late_r29) * 10));
+    }
+  }
+
+  for (const std::string& reason : reasons)
+  {
+    if (!outcome.scout_reason.empty())
+      outcome.scout_reason += '+';
+    outcome.scout_reason += reason;
+  }
+  outcome.scout_breakthrough = !reasons.empty();
+}
+
+bool ShouldStopOutcome(const Outcome& outcome)
+{
+  return outcome.target || (s_state.config.scout_enabled && s_state.config.scout_stop_on_first &&
+                            outcome.scout_breakthrough);
+}
+
 void UpdateOutcome(Outcome& outcome)
 {
   outcome.has_grenade_route = false;
   outcome.has_money_route = false;
+  outcome.max_money_probe_stage = 0;
   for (const DropEvent& event : outcome.events)
   {
     outcome.has_grenade_route |= event.route_seen || IsGrenade(event);
     outcome.has_money_route |= IsMoney(event) ||
                                std::any_of(event.money_probes.begin(), event.money_probes.end(),
                                            [](const ProbeState& probe) { return probe.seen; });
+    outcome.max_money_probe_stage =
+        std::max(outcome.max_money_probe_stage, MoneyProbeStage(event));
   }
 
   bool goal = false;
@@ -892,6 +1029,7 @@ void UpdateOutcome(Outcome& outcome)
   }
   fitness += outcome.completed_count * 1000 + outcome.gate_count * 100;
   outcome.fitness = fitness;
+  UpdateScoutOutcome(outcome);
 }
 
 std::vector<u64> Signature(const Outcome& outcome)
@@ -1205,8 +1343,11 @@ bool TryOpenResultsLocked(const std::string& directory)
         "drop{}_class,",
         drop, drop, drop, drop, drop, drop, drop, drop, drop, drop);
   }
-  s_state.results << "matched_targets,target,fitness,grenade_route,money_route,novel_signature,"
-                     "corpus_size,adaptive_points,adaptive_rank,status,elapsed_ms\n";
+  s_state.results
+      << "matched_targets,target,scout_breakthrough,scout_reason,fitness,coverage_score,"
+         "grenade_route,money_route,max_money_probe_stage,novel_signature,novel_gate_seed,"
+         "novel_route_seed,novel_grenade_id,novel_money_value,corpus_size,adaptive_points,"
+         "adaptive_rank,status,elapsed_ms\n";
   s_state.results.flush();
   if (!s_state.results)
   {
@@ -1231,7 +1372,7 @@ bool OpenResultsLocked()
   const std::string locator_path =
       File::GetExeDirectory() + DIR_SEP + "RE4DropSearchOutput" + WorkerSuffix() + ".txt";
   const std::string locator =
-      fmt::format("RE4 JPN DROP SEARCH v7.2\nWorker: {}\nResults CSV: {}\n",
+      fmt::format("RE4 JPN DROP SEARCH v8.0\nWorker: {}\nResults CSV: {}\n",
                   WorkerDescription(), s_state.results_path);
   if (!File::WriteStringToFile(locator_path, locator))
     s_state.output_error += fmt::format("cannot write output locator '{}'; ", locator_path);
@@ -1260,14 +1401,19 @@ void WriteResultLocked(const Plan& plan, const Outcome& outcome, double elapsed_
     WriteEventCSV(s_state.results, event);
     s_state.results << ',';
   }
-  s_state.results << fmt::format("{},{},{},{},{},{},{},{},{},{},{:.3f}\n",
-                                 outcome.matched_targets, outcome.target ? 1 : 0,
-                                 outcome.fitness, outcome.has_grenade_route ? 1 : 0,
-                                 outcome.has_money_route ? 1 : 0,
-                                 outcome.novel_signature ? 1 : 0, s_state.corpus.size(),
-                                 outcome.difficulty_points, outcome.difficulty_rank,
-                                 outcome.status, elapsed_ms);
-  if ((s_state.attempts % 100) == 0 || outcome.target)
+  s_state.results << outcome.matched_targets << ',' << (outcome.target ? 1 : 0) << ','
+                  << (outcome.scout_breakthrough ? 1 : 0) << ',' << outcome.scout_reason << ','
+                  << outcome.fitness << ',' << outcome.coverage_score << ','
+                  << (outcome.has_grenade_route ? 1 : 0) << ','
+                  << (outcome.has_money_route ? 1 : 0) << ',' << outcome.max_money_probe_stage
+                  << ',' << (outcome.novel_signature ? 1 : 0) << ','
+                  << (outcome.novel_gate_seed ? 1 : 0) << ','
+                  << (outcome.novel_route_seed ? 1 : 0) << ','
+                  << (outcome.novel_grenade_id ? 1 : 0) << ','
+                  << (outcome.novel_money_value ? 1 : 0) << ',' << s_state.corpus.size() << ','
+                  << outcome.difficulty_points << ',' << static_cast<u32>(outcome.difficulty_rank)
+                  << ',' << outcome.status << ',' << fmt::format("{:.3f}", elapsed_ms) << '\n';
+  if ((s_state.attempts % 100) == 0 || outcome.target || outcome.scout_breakthrough)
     s_state.results.flush();
 }
 
@@ -1307,12 +1453,16 @@ void WriteFoundLocked(bool dtm_written)
   if (!out)
     return;
   out.imbue(std::locale::classic());
-  out << "RE4 JPN GENERIC DROP TARGET FOUND\n";
-  out << "Searcher: v7.2 generic profile engine\n";
+  out << (s_state.current_outcome.target ? "RE4 JPN GENERIC DROP TARGET FOUND\n" :
+                                          "RE4 JPN DROP SCOUT BREAKTHROUGH\n");
+  out << "Searcher: v8.0 generic profile and coverage scout engine\n";
   out << fmt::format("Profile: {}\n", s_state.config.profile);
   out << fmt::format("Worker: {}\n", WorkerDescription());
   out << fmt::format("Target mode: {}\n", TargetModeName(s_state.config.target_mode));
   out << fmt::format("Target: {}\n", TargetDescription());
+  out << fmt::format("Scout enabled: {}\n", s_state.config.scout_enabled ? "yes" : "no");
+  if (s_state.current_outcome.scout_breakthrough)
+    out << fmt::format("Scout reason: {}\n", s_state.current_outcome.scout_reason);
   out << fmt::format("Attempt: {}\n", s_state.attempts);
   out << fmt::format("Plan: {}\n", s_state.current_plan.label);
   out << fmt::format("Parent: {}\n", s_state.current_plan.parent_label);
@@ -1329,9 +1479,9 @@ void WriteFoundLocked(bool dtm_written)
     const DropEvent& event = s_state.current_outcome.events[i];
     out << fmt::format(
         "Drop {}: {} | frame {} | gate ${:04X} | route ${:04X} | grenade ${:08X} | "
-        "late r31 ${:08X} r29 ${:08X}\n",
+        "money probes {} | late r31 ${:08X} r29 ${:08X}\n",
         i + 1, EventClass(event), event.gate_frame, event.gate_seed, event.route_seed,
-        event.grenade_id, event.late_r31, event.late_r29);
+        event.grenade_id, MoneyProbeStage(event), event.late_r31, event.late_r29);
   }
   out << fmt::format("Winning DTM: {}\n",
                      dtm_written ? s_state.found_dtm_path : "ERROR: could not write DTM");
@@ -1347,7 +1497,7 @@ void WriteSummaryLocked(std::string_view status)
   if (!out)
     return;
   out.imbue(std::locale::classic());
-  out << "RE4 JPN GENERIC DROP SEARCH v7.2 SUMMARY\n";
+  out << "RE4 JPN GENERIC DROP SEARCH v8.0 SUMMARY\n";
   out << fmt::format("Status: {}\n", status);
   out << fmt::format("Profile: {}\n", s_state.config.profile);
   out << fmt::format("Worker: {}\n", WorkerDescription());
@@ -1364,11 +1514,33 @@ void WriteSummaryLocked(std::string_view status)
   out << fmt::format("Drops per attempt: {}\n", s_state.config.expected_drops);
   out << fmt::format("Target mode: {}\n", TargetModeName(s_state.config.target_mode));
   out << fmt::format("Target: {}\n", TargetDescription());
+  out << fmt::format("Scout enabled: {}\n", s_state.config.scout_enabled ? "yes" : "no");
+  out << fmt::format("Scout stop on first breakthrough: {}\n",
+                     s_state.config.scout_stop_on_first ? "yes" : "no");
+  if (s_state.current_outcome.scout_breakthrough)
+    out << fmt::format("Scout breakthrough reason: {}\n", s_state.current_outcome.scout_reason);
+  out << fmt::format("Scout minimum money probe stage: {}\n",
+                     s_state.config.scout_min_money_probe_stage);
+  out << "Scout known route seeds:";
+  for (u16 seed : s_state.config.scout_known_route_seeds)
+    out << fmt::format(" ${:04X}", seed);
+  out << '\n';
+  out << "Scout known grenade IDs:";
+  for (u32 id : s_state.config.scout_known_grenade_ids)
+    out << ' ' << id;
+  out << '\n';
+  out << "Scout known money amounts:";
+  for (u32 units : s_state.config.scout_known_money_units)
+    out << ' ' << static_cast<u64>(units) * 10;
+  out << '\n';
   out << fmt::format("Capture frame: {}\n", s_state.config.capture_frame);
   out << fmt::format("Effective mutation window: {}..{}\n", s_state.config.window_first,
                      s_state.effective_window_last);
   out << fmt::format("Maximum movement cost: {} frames\n",
                      s_state.config.max_movement_cost_frames);
+  out << fmt::format("Fresh plan percentage: {}\n", s_state.config.fresh_plan_percent);
+  out << fmt::format("Worker plan partition: {}\n",
+                     s_state.config.partition_workers ? "enabled" : "disabled");
   out << fmt::format("Unique signatures: {}\n", s_state.seen_signatures.size());
   out << fmt::format("Unique gate seeds: {}\n", s_state.seen_gate_seeds.size());
   out << fmt::format("Unique route seeds: {}\n", s_state.seen_route_seeds.size());
@@ -1405,28 +1577,47 @@ void InsertFocused(std::vector<CorpusEntry>& corpus, CorpusEntry entry)
 
 void RecordCoverageLocked(const Plan& plan, Outcome& outcome)
 {
+  outcome.novel_gate_seed = false;
+  outcome.novel_route_seed = false;
+  outcome.novel_grenade_id = false;
+  outcome.novel_money_value = false;
   for (const DropEvent& event : outcome.events)
   {
     if (event.gate_seen)
-      s_state.seen_gate_seeds.insert(event.gate_seed);
+      outcome.novel_gate_seed |= s_state.seen_gate_seeds.insert(event.gate_seed).second;
     if (event.route_seen)
-      s_state.seen_route_seeds.insert(event.route_seed);
+      outcome.novel_route_seed |= s_state.seen_route_seeds.insert(event.route_seed).second;
     if (IsGrenade(event))
-      s_state.seen_grenade_ids.insert(event.grenade_id);
+      outcome.novel_grenade_id |= s_state.seen_grenade_ids.insert(event.grenade_id).second;
     if (IsMoney(event))
-      s_state.seen_money_units.insert(event.late_r29);
+      outcome.novel_money_value |= s_state.seen_money_units.insert(event.late_r29).second;
   }
 
   outcome.novel_signature = s_state.seen_signatures.insert(Signature(outcome)).second;
+  outcome.coverage_score = outcome.fitness;
+  if (outcome.novel_signature)
+    outcome.coverage_score += 100000;
+  if (outcome.novel_gate_seed)
+    outcome.coverage_score += 600000;
+  if (outcome.novel_route_seed)
+    outcome.coverage_score += 2000000;
+  if (outcome.novel_grenade_id)
+    outcome.coverage_score += 2000000;
+  if (outcome.novel_money_value)
+    outcome.coverage_score += 1000000;
+  outcome.coverage_score += static_cast<u64>(outcome.max_money_probe_stage) * 250000;
+  if (outcome.scout_breakthrough)
+    outcome.coverage_score += 4000000000ULL;
+
   if ((s_state.corpus.empty() || outcome.novel_signature || outcome.matched_targets != 0) &&
       s_state.corpus.size() < MAX_CORPUS_ENTRIES)
   {
-    s_state.corpus.push_back({plan, outcome, outcome.fitness});
+    s_state.corpus.push_back({plan, outcome, outcome.coverage_score});
   }
   if (outcome.has_grenade_route && (outcome.novel_signature || s_state.route_corpus.empty()))
-    InsertFocused(s_state.route_corpus, {plan, outcome, outcome.fitness + 500000});
+    InsertFocused(s_state.route_corpus, {plan, outcome, outcome.coverage_score + 500000});
   if (outcome.has_money_route && (outcome.novel_signature || s_state.money_corpus.empty()))
-    InsertFocused(s_state.money_corpus, {plan, outcome, outcome.fitness + 500000});
+    InsertFocused(s_state.money_corpus, {plan, outcome, outcome.coverage_score + 500000});
 
   for (size_t target_index = 0; target_index < s_state.config.targets.size(); ++target_index)
   {
@@ -1585,6 +1776,16 @@ bool WantsMoneyTarget()
 Plan SelectParentLocked()
 {
   const size_t roll = RandomIndexLocked(100);
+  if (s_state.config.scout_enabled)
+  {
+    if (roll < 30 && !s_state.route_corpus.empty())
+      return TournamentLocked(s_state.route_corpus).plan;
+    if (roll < 60 && !s_state.money_corpus.empty())
+      return TournamentLocked(s_state.money_corpus).plan;
+    if (roll < 90 && !s_state.corpus.empty())
+      return TournamentLocked(s_state.corpus).plan;
+    return MakePlan(2);
+  }
   if (roll < 35 && !s_state.target_corpora.empty())
   {
     const size_t start = RandomIndexLocked(s_state.target_corpora.size());
@@ -1660,10 +1861,29 @@ void SplicePlanLocked(Plan& plan)
   NormalizePlan(plan);
 }
 
+u64 StablePlanHash(std::string_view label)
+{
+  u64 hash = 1469598103934665603ULL;
+  for (unsigned char value : label)
+  {
+    hash ^= value;
+    hash *= 1099511628211ULL;
+  }
+  return hash;
+}
+
+bool PlanBelongsToWorker(const Plan& plan)
+{
+  return plan.phase < 2 || !s_state.config.partition_workers ||
+         s_state.config.worker_count <= 1 ||
+         StablePlanHash(plan.label) % s_state.config.worker_count == s_state.config.worker_id;
+}
+
 bool QueueUniqueLocked(Plan plan)
 {
   NormalizePlan(plan);
-  if (plan.mutations.empty() || !s_state.known_plan_labels.insert(plan.label).second)
+  if (plan.mutations.empty() || !PlanBelongsToWorker(plan) ||
+      !s_state.known_plan_labels.insert(plan.label).second)
     return false;
   s_state.queue.push_back(std::move(plan));
   return true;
@@ -1678,7 +1898,7 @@ bool BuildNextAdaptivePlanLocked()
     candidate.phase = 2;
     candidate.parent_label = parent.label;
     const size_t operation = RandomIndexLocked(100);
-    if (operation < 12)
+    if (operation < s_state.config.fresh_plan_percent)
     {
       candidate.mutations.clear();
       candidate.parent_label = "FRESH";
@@ -1686,32 +1906,39 @@ bool BuildNextAdaptivePlanLocked()
       for (size_t i = 0; i < count; ++i)
         AddRandomMutationLocked(candidate, &candidate);
     }
-    else if (operation < 55)
-    {
-      AddRandomMutationLocked(candidate, &parent);
-      if (ChanceLocked(28))
-        AddRandomMutationLocked(candidate, &parent);
-    }
-    else if (operation < 76)
-    {
-      EditPlanLocked(candidate);
-    }
-    else if (operation < 87)
-    {
-      if (!candidate.mutations.empty())
-        candidate.mutations.erase(candidate.mutations.begin() +
-                                  RandomIndexLocked(candidate.mutations.size()));
-    }
     else
     {
-      SplicePlanLocked(candidate);
+      const size_t adaptive_operation = RandomIndexLocked(100);
+      if (adaptive_operation < 49)
+      {
+        AddRandomMutationLocked(candidate, &parent);
+        if (ChanceLocked(28))
+          AddRandomMutationLocked(candidate, &parent);
+      }
+      else if (adaptive_operation < 73)
+      {
+        EditPlanLocked(candidate);
+      }
+      else if (adaptive_operation < 86)
+      {
+        if (!candidate.mutations.empty())
+          candidate.mutations.erase(candidate.mutations.begin() +
+                                    RandomIndexLocked(candidate.mutations.size()));
+      }
+      else
+      {
+        SplicePlanLocked(candidate);
+      }
     }
 
     if (candidate.mutations.empty())
       AddRandomMutationLocked(candidate, &parent);
     NormalizePlan(candidate);
-    if (!candidate.mutations.empty() && !s_state.known_plan_labels.contains(candidate.label))
-      return QueueUniqueLocked(std::move(candidate));
+    if (!candidate.mutations.empty() && !s_state.known_plan_labels.contains(candidate.label) &&
+        QueueUniqueLocked(std::move(candidate)))
+    {
+      return true;
+    }
   }
   return false;
 }
@@ -1800,7 +2027,7 @@ void FinishCalibrationLocked()
   s_state.calibration_done = true;
   OSD::AddTypedMessage(
       OSD::MessageType::RE4DropSearch,
-      fmt::format("RE4 v7.2 calibration DONE | {} | {} kinds | {} active slots",
+      fmt::format("RE4 v8.0 calibration DONE | {} | {} kinds | {} active slots",
                   WorkerDescription(), s_state.effective_kinds.size(),
                   s_state.effective_slots.size()),
       OSD::Duration::VERY_LONG, OSD::Color::GREEN);
@@ -1866,7 +2093,7 @@ bool PrepareNextPlanLocked()
     s_state.validation_done = true;
     OSD::AddTypedMessage(
         OSD::MessageType::RE4DropSearch,
-        fmt::format("RE4 v7.2 validation PASSED | {} | {} drops | window {}-{}",
+        fmt::format("RE4 v8.0 validation PASSED | {} | {} drops | window {}-{}",
                     WorkerDescription(), s_state.validation_outcomes[0].completed_count,
                     s_state.config.window_first, s_state.effective_window_last),
         OSD::Duration::VERY_LONG, OSD::Color::GREEN);
@@ -1924,7 +2151,7 @@ void CaptureOnCPUThread(System* system)
     {
       s_state.previous_speed = Config::Get(Config::MAIN_EMULATION_SPEED);
       s_state.validation_error = "emulated CPU/VBI overclock is enabled";
-      FinishSearchLocked(system, "RE4 v7.2 FAILED: disable emulated CPU/VBI overclock",
+      FinishSearchLocked(system, "RE4 v8.0 FAILED: disable emulated CPU/VBI overclock",
                          OSD::Color::RED);
       return;
     }
@@ -1937,7 +2164,7 @@ void CaptureOnCPUThread(System* system)
           "wrong DTM (got {} frames / {} inputs; expected {} / {})", movie.GetTotalFrames(),
           movie.GetTotalInputCount(), s_state.config.expected_movie_frames,
           s_state.config.expected_movie_inputs);
-      FinishSearchLocked(system, "RE4 v7.2 FAILED: DTM does not match the active profile",
+      FinishSearchLocked(system, "RE4 v8.0 FAILED: DTM does not match the active profile",
                          OSD::Color::RED);
       return;
     }
@@ -1948,7 +2175,7 @@ void CaptureOnCPUThread(System* system)
     std::lock_guard lock{s_mutex};
     if (snapshot.empty())
     {
-      FinishSearchLocked(system, "RE4 v7.2 FAILED: in-memory snapshot error", OSD::Color::RED);
+      FinishSearchLocked(system, "RE4 v8.0 FAILED: in-memory snapshot error", OSD::Color::RED);
       return;
     }
     s_state.snapshot = std::move(snapshot);
@@ -1961,7 +2188,7 @@ void CaptureOnCPUThread(System* system)
     {
       FinishSearchLocked(
           system,
-          fmt::format("RE4 v7.2 OUTPUT ERROR | {} | {}", WorkerDescription(),
+          fmt::format("RE4 v8.0 OUTPUT ERROR | {} | {}", WorkerDescription(),
                       s_state.output_error),
           OSD::Color::RED);
       return;
@@ -1970,19 +2197,19 @@ void CaptureOnCPUThread(System* system)
     s_state.search_start = std::chrono::steady_clock::now();
     if (!PrepareNextPlanLocked())
     {
-      FinishSearchLocked(system, "RE4 v7.2 FAILED: could not prepare validation",
+      FinishSearchLocked(system, "RE4 v8.0 FAILED: could not prepare validation",
                          OSD::Color::RED);
       return;
     }
     OSD::AddTypedMessage(
         OSD::MessageType::RE4DropSearch,
-        fmt::format("RE4 DROP SEARCH v7.2 START | {} | {} | F{} | budget {}",
-                    WorkerDescription(), s_state.config.profile, s_state.config.capture_frame,
-                    s_state.config.budget),
+        fmt::format("RE4 DROP SEARCH v8.0 {}START | {} | {} | F{} | budget {}",
+                    s_state.config.scout_enabled ? "SCOUT " : "", WorkerDescription(),
+                    s_state.config.profile, s_state.config.capture_frame, s_state.config.budget),
         OSD::Duration::VERY_LONG, OSD::Color::GREEN);
     OSD::AddTypedMessage(
         OSD::MessageType::RE4DropSearchOutput,
-        fmt::format("RE4 v7.2 OUTPUT | {} | {}", WorkerDescription(), s_state.results_path),
+        fmt::format("RE4 v8.0 OUTPUT | {} | {}", WorkerDescription(), s_state.results_path),
         OSD::Duration::VERY_LONG, OSD::Color::CYAN);
   }
   system->GetCPU().Continue();
@@ -2001,7 +2228,7 @@ void RestoreOnCPUThread(System* system)
     s_state.restore_requested = false;
     if (!restored)
     {
-      FinishSearchLocked(system, "RE4 v7.2 FAILED: in-memory restore error", OSD::Color::RED);
+      FinishSearchLocked(system, "RE4 v8.0 FAILED: in-memory restore error", OSD::Color::RED);
       return;
     }
     if (!PrepareNextPlanLocked())
@@ -2009,7 +2236,7 @@ void RestoreOnCPUThread(System* system)
       if (!s_state.validation_done)
       {
         FinishSearchLocked(system,
-                           fmt::format("RE4 v7.2 validation FAILED | {} | {}",
+                           fmt::format("RE4 v8.0 validation FAILED | {} | {}",
                                        WorkerDescription(), s_state.validation_error),
                            OSD::Color::RED);
       }
@@ -2017,7 +2244,7 @@ void RestoreOnCPUThread(System* system)
       {
         FinishSearchLocked(
             system,
-            fmt::format("RE4 v7.2 DONE | {} | {} attempts | {} signatures",
+            fmt::format("RE4 v8.0 DONE | {} | {} attempts | {} signatures",
                         WorkerDescription(), s_state.attempts, s_state.seen_signatures.size()),
             OSD::Color::YELLOW);
       }
@@ -2030,6 +2257,7 @@ void RestoreOnCPUThread(System* system)
 void CompleteAttempt(System* system, std::string status)
 {
   bool found = false;
+  bool found_is_target = false;
   bool request_restore = false;
   bool new_grenade_route = false;
   bool new_money_route = false;
@@ -2037,6 +2265,7 @@ void CompleteAttempt(System* system, std::string status)
   u64 attempts = 0;
   double rate = 0.0;
   std::string found_plan;
+  std::string found_reason;
 
   {
     std::lock_guard lock{s_mutex};
@@ -2064,13 +2293,15 @@ void CompleteAttempt(System* system, std::string status)
     if (!s_state.validation_done)
       s_state.validation_outcomes.push_back(s_state.current_outcome);
 
-    if (s_state.current_outcome.target)
+    if (ShouldStopOutcome(s_state.current_outcome))
     {
       s_state.found = true;
       found = true;
+      found_is_target = s_state.current_outcome.target;
       dtm_written = WriteWinningDTMLocked(system);
       WriteFoundLocked(dtm_written);
       found_plan = s_state.current_plan.label;
+      found_reason = s_state.current_outcome.scout_reason;
     }
     else
     {
@@ -2087,14 +2318,14 @@ void CompleteAttempt(System* system, std::string status)
     if (new_grenade_route && s_state.route_corpus.size() <= 20)
     {
       OSD::AddTypedMessage(OSD::MessageType::RE4DropSearch,
-                           fmt::format("RE4 v7.2 GRENADE ROUTE | {} | attempt {} | parents {}",
+                           fmt::format("RE4 v8.0 GRENADE ROUTE | {} | attempt {} | parents {}",
                                        WorkerDescription(), attempts, s_state.route_corpus.size()),
                            OSD::Duration::VERY_LONG, OSD::Color::GREEN);
     }
     else if (new_money_route && s_state.money_corpus.size() <= 20)
     {
       OSD::AddTypedMessage(OSD::MessageType::RE4DropSearch,
-                           fmt::format("RE4 v7.2 MONEY ROUTE | {} | attempt {} | parents {}",
+                           fmt::format("RE4 v8.0 MONEY ROUTE | {} | attempt {} | parents {}",
                                        WorkerDescription(), attempts, s_state.money_corpus.size()),
                            OSD::Duration::VERY_LONG, OSD::Color::CYAN);
     }
@@ -2104,11 +2335,12 @@ void CompleteAttempt(System* system, std::string status)
       OSD::AddTypedMessage(
           OSD::MessageType::RE4DropSearch,
           fmt::format(
-              "RE4 v7.2 | {} | {} | {:.2f}/s | phase {} | cost {}/{} | corpus {} | G {} | P {}",
+              "RE4 v8.0 | {} | {} | {:.2f}/s | phase {} | cost {}/{} | corpus {} | G {} | P {} | MP {}",
               WorkerDescription(), attempts, rate, s_state.current_plan.phase,
               s_state.current_plan.movement_cost_frames,
               s_state.config.max_movement_cost_frames, s_state.corpus.size(),
-              s_state.route_corpus.size(), s_state.money_corpus.size()),
+              s_state.route_corpus.size(), s_state.money_corpus.size(),
+              s_state.current_outcome.max_money_probe_stage),
           OSD::Duration::VERY_LONG, OSD::Color::CYAN);
     }
   }
@@ -2116,11 +2348,14 @@ void CompleteAttempt(System* system, std::string status)
   if (found)
   {
     std::lock_guard lock{s_mutex};
-    FinishSearchLocked(system,
-                       fmt::format("RE4 v7.2 TARGET FOUND | {} | attempt {} | DTM {} | {}",
-                                   WorkerDescription(), attempts, dtm_written ? "OK" : "ERROR",
-                                   found_plan),
-                       OSD::Color::GREEN);
+    const std::string result = found_is_target ? "TARGET FOUND" : "SCOUT BREAKTHROUGH";
+    const std::string reason = found_reason.empty() ? "" : fmt::format(" | {}", found_reason);
+    FinishSearchLocked(
+        system,
+        fmt::format("RE4 v8.0 {} | {} | attempt {} | DTM {} | {}{}", result,
+                    WorkerDescription(), attempts, dtm_written ? "OK" : "ERROR", found_plan,
+                    reason),
+        OSD::Color::GREEN);
     return;
   }
   if (request_restore)
@@ -2166,19 +2401,19 @@ void ResetSession()
   if (!loaded)
   {
     OSD::AddTypedMessage(OSD::MessageType::RE4DropSearch,
-                         fmt::format("RE4 v7.2 CONFIG ERROR | {}", s_state.config_error),
+                         fmt::format("RE4 v8.0 CONFIG ERROR | {}", s_state.config_error),
                          OSD::Duration::VERY_LONG, OSD::Color::RED);
     return;
   }
   if (!s_state.config.enabled)
   {
-    OSD::AddTypedMessage(OSD::MessageType::RE4DropSearch, "RE4 drop search v7.2 disabled in INI",
+    OSD::AddTypedMessage(OSD::MessageType::RE4DropSearch, "RE4 drop search v8.0 disabled in INI",
                          OSD::Duration::NORMAL, OSD::Color::YELLOW);
     return;
   }
   OSD::AddTypedMessage(
       OSD::MessageType::RE4DropSearch,
-      fmt::format("RE4 drop search v7.2 armed | {} | {} | {} drops | target {}",
+      fmt::format("RE4 drop search v8.0 armed | {} | {} | {} drops | target {}",
                   WorkerDescription(), s_state.config.profile, s_state.config.expected_drops,
                   TargetDescription()),
       OSD::Duration::VERY_LONG, OSD::Color::GREEN);
@@ -2249,6 +2484,7 @@ bool OnDropProbe(System* system, u32 pc)
 
   bool complete_now = false;
   bool target = false;
+  bool stop = false;
   {
     std::lock_guard lock{s_mutex};
     if (!s_state.active || s_state.finished)
@@ -2315,14 +2551,18 @@ bool OnDropProbe(System* system, u32 pc)
 
     UpdateOutcome(outcome);
     target = outcome.target;
+    stop = ShouldStopOutcome(outcome);
     const bool expected_complete = s_state.config.expected_drops != 0 &&
                                    outcome.completed_count >= s_state.config.expected_drops;
-    const bool auto_target_complete = s_state.config.expected_drops == 0 && target;
-    complete_now = expected_complete || auto_target_complete;
+    const bool auto_stop_complete = s_state.config.expected_drops == 0 && stop;
+    complete_now = expected_complete || auto_stop_complete;
   }
 
   if (complete_now)
-    CompleteAttempt(system, target ? "target" : "drops_complete");
+  {
+    CompleteAttempt(system,
+                    target ? "target" : (stop ? "scout_breakthrough" : "drops_complete"));
+  }
   return true;
 }
 

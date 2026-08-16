@@ -1,4 +1,4 @@
-name: RE4 JPN Generic Drop Search v7.2 Windows Build
+name: RE4 JPN Village Route Scout v8.0 Windows Build
 
 on:
   workflow_dispatch:
@@ -12,7 +12,7 @@ on:
       - Source/Core/Core/RE4RNGSearch.h
       - Source/Core/VideoCommon/OnScreenDisplay.h
       - RE4DropSearch.ini
-      - RE4_DROP_SEARCH_V7_README.txt
+      - RE4_DROP_SEARCH_V8_README.txt
       - .github/workflows/re4-jpn-drop-search-v7-windows.yml
 
 permissions:
@@ -45,14 +45,14 @@ jobs:
           $exe = Get-ChildItem -Path $binaries -Filter Dolphin.exe -Recurse | Select-Object -First 1
           if (-not $exe) { throw 'Dolphin.exe was not produced.' }
           Copy-Item RE4DropSearch.ini (Join-Path $binaries 'RE4DropSearch.ini') -Force
-          Copy-Item RE4_DROP_SEARCH_V7_README.txt (Join-Path $binaries 'RE4_DROP_SEARCH_V7_README.txt') -Force
+          Copy-Item RE4_DROP_SEARCH_V8_README.txt (Join-Path $binaries 'RE4_DROP_SEARCH_V8_README.txt') -Force
           New-Item (Join-Path $binaries 'portable.txt') -ItemType File -Force | Out-Null
           Write-Host "Built executable: $($exe.FullName)"
 
       - name: Upload portable Dolphin build
         uses: actions/upload-artifact@v4
         with:
-          name: Dolphin-RE4-JPN-Generic-Drop-Search-v7.2-Windows-x64
+          name: Dolphin-RE4-JPN-Village-Route-Scout-v8.0-Windows-x64
           path: build/release/x64/Binaries/**
           if-no-files-found: error
           compression-level: 6
