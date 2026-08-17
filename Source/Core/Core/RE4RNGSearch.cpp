@@ -67,6 +67,7 @@ constexpr std::string_view CONFIG_FILENAME = "RE4DropSearch.ini";
 enum class MutationKind : u8
 {
   BOff,
+  BOn,
   LOn,
   ROn,
   StickXDelta,
@@ -116,26 +117,33 @@ struct TargetSpec
 struct SearchConfig
 {
   bool enabled = true;
-  std::string profile = "Village dual route scout - window 7805";
-  std::string output_prefix = "re4_jpn_village_dual_v8_scout";
-  u64 expected_movie_frames = 8106;
-  u64 expected_movie_inputs = 16207;
-  u64 capture_frame = 7803;
-  u64 window_first = 7806;
-  u64 window_max = 8032;
-  u64 movement_first = 7805;
-  u64 movement_last = 8032;
-  u64 hard_end_frame = 8088;
-  u64 budget = 20000;
-  u32 expected_drops = 2;
-  u32 max_movement_cost_frames = 4;
+  std::string profile = "Village explosion 2 structured poke search";
+  std::string output_prefix = "re4_jpn_village_exp2_pokes_v9";
+  u64 expected_movie_frames = 8500;
+  u64 expected_movie_inputs = 16995;
+  u64 capture_frame = 8425;
+  u64 window_first = 8428;
+  u64 window_max = 8466;
+  u64 movement_first = 8427;
+  u64 movement_last = 8466;
+  u64 hard_end_frame = 8490;
+  u64 budget = 5000;
+  u32 expected_drops = 1;
+  u32 max_movement_cost_frames = 64;
   u32 max_plan_mutations = 12;
   u32 max_hold_slots = 6;
   u32 calibration_anchors = 15;
   u32 fresh_plan_percent = 35;
   bool full_calibration = true;
+  bool structured_pokes = false;
+  bool structured_diagonals = true;
+  bool structured_button_offsets = true;
+  bool structured_stop_if_no_gate_seed_change = false;
+  u32 structured_max_poke_slots = 2;
+  u32 structured_max_gap_slots = 3;
+  std::vector<int> structured_poke_amounts{96, 127};
   u32 worker_id = 0;
-  u32 worker_count = 1;
+  u32 worker_count = 4;
   bool partition_workers = true;
   u64 fuzz_seed = DEFAULT_FUZZ_SEED;
   u32 hand_grenade_id = 1;
@@ -266,6 +274,11 @@ struct SearchState
   std::set<u64> effective_slots;
   std::unordered_set<std::string> known_plan_labels;
   std::map<u64, std::array<u8, sizeof(Movie::ControllerState)>> mutated_inputs;
+  u64 scheduled_polls = 0;
+  u64 changed_polls = 0;
+  u64 first_changed_frame = 0;
+  u64 last_changed_frame = 0;
+  u64 changed_state_hash = 0;
   float previous_speed = 1.0f;
   std::string config_path;
   std::string config_error;
@@ -352,6 +365,8 @@ std::optional<MutationKind> ParseMutationKind(std::string text)
   text = Upper(Trim(std::move(text)));
   if (text == "B_OFF" || text == "B")
     return MutationKind::BOff;
+  if (text == "B_ON")
+    return MutationKind::BOn;
   if (text == "L")
     return MutationKind::LOn;
   if (text == "R")
@@ -375,6 +390,8 @@ std::string KindName(MutationKind kind, int amount = 0)
   {
   case MutationKind::BOff:
     return "B_OFF";
+  case MutationKind::BOn:
+    return "B_ON";
   case MutationKind::LOn:
     return "L";
   case MutationKind::ROn:
@@ -398,6 +415,7 @@ ControlGroup GetControlGroup(MutationKind kind)
   switch (kind)
   {
   case MutationKind::BOff:
+  case MutationKind::BOn:
     return ControlGroup::B;
   case MutationKind::LOn:
     return ControlGroup::L;
@@ -568,6 +586,9 @@ bool LoadConfig(SearchConfig* config, std::string* path, std::string* error)
       !GetIniU32(ini, "Mutations", "MaxHoldSlots", &config->max_hold_slots, error) ||
       !GetIniU32(ini, "Mutations", "CalibrationAnchors", &config->calibration_anchors, error) ||
       !GetIniU32(ini, "Mutations", "FreshPlanPercent", &config->fresh_plan_percent, error) ||
+      !GetIniU32(ini, "Structured", "MaxPokeSlots", &config->structured_max_poke_slots,
+                 error) ||
+      !GetIniU32(ini, "Structured", "MaxGapSlots", &config->structured_max_gap_slots, error) ||
       !GetIniU32(ini, "Scout", "MinimumMoneyProbeStage",
                  &config->scout_min_money_probe_stage, error) ||
       !GetIniU32(ini, "Memory", "AdaptivePointsAddress",
@@ -577,6 +598,12 @@ bool LoadConfig(SearchConfig* config, std::string* path, std::string* error)
     return false;
   }
   GetIniValue(ini, "Mutations", "FullCalibration", &config->full_calibration);
+  GetIniValue(ini, "Structured", "Enabled", &config->structured_pokes);
+  GetIniValue(ini, "Structured", "IncludeDiagonals", &config->structured_diagonals);
+  GetIniValue(ini, "Structured", "IncludeButtonOffsets",
+              &config->structured_button_offsets);
+  GetIniValue(ini, "Structured", "StopIfNoGateSeedChange",
+              &config->structured_stop_if_no_gate_seed_change);
   GetIniValue(ini, "Search", "PartitionWorkers", &config->partition_workers);
   GetIniValue(ini, "Scout", "Enabled", &config->scout_enabled);
   GetIniValue(ini, "Scout", "StopOnFirstBreakthrough", &config->scout_stop_on_first);
@@ -673,6 +700,28 @@ bool LoadConfig(SearchConfig* config, std::string* path, std::string* error)
       return false;
     }
     config->forced_kinds.insert(*kind);
+  }
+
+  std::string poke_amounts;
+  if (GetIniString(ini, "Structured", "PokeAmounts", &poke_amounts))
+  {
+    config->structured_poke_amounts.clear();
+    for (const std::string& token : SplitList(poke_amounts))
+    {
+      const std::optional<u64> amount = ParseU64(token);
+      if (!amount || *amount == 0 || *amount > 127)
+      {
+        *error = fmt::format("invalid structured poke amount '{}'", token);
+        return false;
+      }
+      const int narrow = static_cast<int>(*amount);
+      if (std::find(config->structured_poke_amounts.begin(),
+                    config->structured_poke_amounts.end(), narrow) ==
+          config->structured_poke_amounts.end())
+      {
+        config->structured_poke_amounts.push_back(narrow);
+      }
+    }
   }
 
   std::string hotspots;
@@ -772,6 +821,14 @@ bool LoadConfig(SearchConfig* config, std::string* path, std::string* error)
     *error = "CalibrationAnchors must be 1..128";
   else if (config->fresh_plan_percent > 100)
     *error = "FreshPlanPercent must be 0..100";
+  else if (config->structured_pokes && config->structured_poke_amounts.empty())
+    *error = "Structured PokeAmounts is empty";
+  else if (config->structured_max_poke_slots == 0 ||
+           config->structured_max_poke_slots > config->max_hold_slots)
+    *error = "Structured MaxPokeSlots must be 1..MaxHoldSlots";
+  else if (config->structured_max_gap_slots == 0 ||
+           config->structured_max_gap_slots > 8)
+    *error = "Structured MaxGapSlots must be 1..8";
   else if (config->scout_min_money_probe_stage > MONEY_PROBE_PCS.size())
     *error = "MinimumMoneyProbeStage must be 0..3";
 
@@ -1080,6 +1137,7 @@ bool CostsMovement(const Mutation& mutation)
   switch (mutation.kind)
   {
   case MutationKind::BOff:
+  case MutationKind::BOn:
   case MutationKind::LOn:
   case MutationKind::ROn:
   case MutationKind::StickYCenter:
@@ -1226,6 +1284,9 @@ void ApplyMutation(Movie::ControllerState& state, const Mutation& mutation)
   case MutationKind::BOff:
     state.B = false;
     break;
+  case MutationKind::BOn:
+    state.B = true;
+    break;
   case MutationKind::LOn:
     state.L = true;
     state.TriggerL = 255;
@@ -1333,7 +1394,10 @@ bool TryOpenResultsLocked(const std::string& directory)
   s_state.output_directory = directory;
   s_state.results_path = path;
   s_state.results.imbue(std::locale::classic());
-  s_state.results << "attempt,phase,plan,parent,movement_cost_frames,mutations,completed_drops,";
+  s_state.results
+      << "attempt,phase,plan,parent,movement_cost_frames,mutations,scheduled_polls,"
+         "changed_polls,first_changed_frame,last_changed_frame,changed_state_hash,"
+         "completed_drops,";
   for (size_t i = 0; i < EventCapacity(); ++i)
   {
     const size_t drop = i + 1;
@@ -1372,7 +1436,7 @@ bool OpenResultsLocked()
   const std::string locator_path =
       File::GetExeDirectory() + DIR_SEP + "RE4DropSearchOutput" + WorkerSuffix() + ".txt";
   const std::string locator =
-      fmt::format("RE4 JPN DROP SEARCH v8.0\nWorker: {}\nResults CSV: {}\n",
+      fmt::format("RE4 JPN DROP SEARCH v9.0\nWorker: {}\nResults CSV: {}\n",
                   WorkerDescription(), s_state.results_path);
   if (!File::WriteStringToFile(locator_path, locator))
     s_state.output_error += fmt::format("cannot write output locator '{}'; ", locator_path);
@@ -1393,9 +1457,11 @@ void WriteResultLocked(const Plan& plan, const Outcome& outcome, double elapsed_
 {
   if (!s_state.results)
     return;
-  s_state.results << fmt::format("{},{},{},{},{},{},{},", s_state.attempts, plan.phase,
-                                 plan.label, plan.parent_label, plan.movement_cost_frames,
-                                 plan.mutations.size(), outcome.completed_count);
+  s_state.results << fmt::format(
+      "{},{},{},{},{},{},{},{},{},{},${:016X},{},", s_state.attempts, plan.phase,
+      plan.label, plan.parent_label, plan.movement_cost_frames, plan.mutations.size(),
+      s_state.scheduled_polls, s_state.changed_polls, s_state.first_changed_frame,
+      s_state.last_changed_frame, s_state.changed_state_hash, outcome.completed_count);
   for (const DropEvent& event : outcome.events)
   {
     WriteEventCSV(s_state.results, event);
@@ -1455,7 +1521,7 @@ void WriteFoundLocked(bool dtm_written)
   out.imbue(std::locale::classic());
   out << (s_state.current_outcome.target ? "RE4 JPN GENERIC DROP TARGET FOUND\n" :
                                           "RE4 JPN DROP SCOUT BREAKTHROUGH\n");
-  out << "Searcher: v8.0 generic profile and coverage scout engine\n";
+  out << "Searcher: v9.0 structured poke and adaptive search engine\n";
   out << fmt::format("Profile: {}\n", s_state.config.profile);
   out << fmt::format("Worker: {}\n", WorkerDescription());
   out << fmt::format("Target mode: {}\n", TargetModeName(s_state.config.target_mode));
@@ -1469,6 +1535,10 @@ void WriteFoundLocked(bool dtm_written)
   out << fmt::format("Estimated movement cost: {} / {} emulated frames\n",
                      s_state.current_plan.movement_cost_frames,
                      s_state.config.max_movement_cost_frames);
+  out << fmt::format("Input polls: {} changed / {} scheduled | frames {}..{} | hash ${:016X}\n",
+                     s_state.changed_polls, s_state.scheduled_polls,
+                     s_state.first_changed_frame, s_state.last_changed_frame,
+                     s_state.changed_state_hash);
   out << fmt::format("Mutation window: {}..{}\n", s_state.config.window_first,
                      s_state.effective_window_last);
   out << fmt::format("Adaptive difficulty: points {} | rank {}\n",
@@ -1497,7 +1567,7 @@ void WriteSummaryLocked(std::string_view status)
   if (!out)
     return;
   out.imbue(std::locale::classic());
-  out << "RE4 JPN GENERIC DROP SEARCH v8.0 SUMMARY\n";
+  out << "RE4 JPN GENERIC DROP SEARCH v9.0 SUMMARY\n";
   out << fmt::format("Status: {}\n", status);
   out << fmt::format("Profile: {}\n", s_state.config.profile);
   out << fmt::format("Worker: {}\n", WorkerDescription());
@@ -1539,6 +1609,21 @@ void WriteSummaryLocked(std::string_view status)
   out << fmt::format("Maximum movement cost: {} frames\n",
                      s_state.config.max_movement_cost_frames);
   out << fmt::format("Fresh plan percentage: {}\n", s_state.config.fresh_plan_percent);
+  out << fmt::format("Structured poke scan: {}\n",
+                     s_state.config.structured_pokes ? "enabled" : "disabled");
+  if (s_state.config.structured_pokes)
+  {
+    out << "Structured poke amounts:";
+    for (int amount : s_state.config.structured_poke_amounts)
+      out << ' ' << amount;
+    out << '\n';
+    out << fmt::format("Structured max poke slots: {}\n",
+                       s_state.config.structured_max_poke_slots);
+    out << fmt::format("Structured max gap slots: {}\n",
+                       s_state.config.structured_max_gap_slots);
+    out << fmt::format("Stop after zero gate-seed diversity: {}\n",
+                       s_state.config.structured_stop_if_no_gate_seed_change ? "yes" : "no");
+  }
   out << fmt::format("Worker plan partition: {}\n",
                      s_state.config.partition_workers ? "enabled" : "disabled");
   out << fmt::format("Unique signatures: {}\n", s_state.seen_signatures.size());
@@ -1874,7 +1959,7 @@ u64 StablePlanHash(std::string_view label)
 
 bool PlanBelongsToWorker(const Plan& plan)
 {
-  return plan.phase < 2 || !s_state.config.partition_workers ||
+  return plan.phase == 0 || !s_state.config.partition_workers ||
          s_state.config.worker_count <= 1 ||
          StablePlanHash(plan.label) % s_state.config.worker_count == s_state.config.worker_id;
 }
@@ -1990,8 +2075,158 @@ std::vector<u64> CalibrationSlotsLocked()
   return slots;
 }
 
+bool IsAllowedKind(MutationKind kind)
+{
+  return std::find(s_state.config.allowed_kinds.begin(), s_state.config.allowed_kinds.end(),
+                   kind) != s_state.config.allowed_kinds.end();
+}
+
+struct DirectionPoke
+{
+  MutationKind kind;
+  int amount;
+};
+
+std::vector<DirectionPoke> DirectionPokes(int amount)
+{
+  std::vector<DirectionPoke> directions;
+  if (IsAllowedKind(MutationKind::StickXDelta))
+  {
+    directions.push_back({MutationKind::StickXDelta, -amount});
+    directions.push_back({MutationKind::StickXDelta, amount});
+  }
+  if (IsAllowedKind(MutationKind::StickYDelta))
+  {
+    directions.push_back({MutationKind::StickYDelta, -amount});
+    directions.push_back({MutationKind::StickYDelta, amount});
+  }
+  return directions;
+}
+
+std::vector<MutationKind> StructuredButtons()
+{
+  std::vector<MutationKind> buttons;
+  for (MutationKind kind : {MutationKind::BOn, MutationKind::LOn, MutationKind::ROn})
+  {
+    if (IsAllowedKind(kind))
+      buttons.push_back(kind);
+  }
+  return buttons;
+}
+
+void BuildStructuredPokeQueueLocked()
+{
+  const std::vector<u64> slots = CalibrationSlotsLocked();
+  const std::vector<MutationKind> buttons = StructuredButtons();
+  const size_t before = s_state.queue.size();
+
+  for (u64 slot : slots)
+  {
+    for (MutationKind button : buttons)
+    {
+      for (u32 duration = 1; duration <= s_state.config.structured_max_poke_slots; ++duration)
+      {
+        QueueUniqueLocked(MakePlan(
+            1, {MakeMutation(slot, button, static_cast<u8>(duration))}));
+      }
+    }
+
+    for (int amount : s_state.config.structured_poke_amounts)
+    {
+      const std::vector<DirectionPoke> directions = DirectionPokes(amount);
+      for (const DirectionPoke& direction : directions)
+      {
+        for (u32 duration = 1; duration <= s_state.config.structured_max_poke_slots; ++duration)
+        {
+          QueueUniqueLocked(MakePlan(
+              1, {MakeMutation(slot, direction.kind, static_cast<u8>(duration),
+                               direction.amount)}));
+        }
+        for (MutationKind button : buttons)
+        {
+          QueueUniqueLocked(MakePlan(
+              1, {MakeMutation(slot, button),
+                  MakeMutation(slot, direction.kind, 1, direction.amount)}));
+        }
+      }
+
+      if (s_state.config.structured_diagonals &&
+          IsAllowedKind(MutationKind::StickXDelta) &&
+          IsAllowedKind(MutationKind::StickYDelta))
+      {
+        for (int x_sign : {-1, 1})
+        {
+          for (int y_sign : {-1, 1})
+          {
+            const std::vector<Mutation> diagonal = {
+                MakeMutation(slot, MutationKind::StickXDelta, 1, x_sign * amount),
+                MakeMutation(slot, MutationKind::StickYDelta, 1, y_sign * amount)};
+            QueueUniqueLocked(MakePlan(1, diagonal));
+            for (MutationKind button : buttons)
+            {
+              std::vector<Mutation> combined = diagonal;
+              combined.push_back(MakeMutation(slot, button));
+              QueueUniqueLocked(MakePlan(1, std::move(combined)));
+            }
+          }
+        }
+      }
+
+      if (s_state.config.structured_button_offsets && slot + 2 <= s_state.effective_window_last)
+      {
+        for (const DirectionPoke& direction : directions)
+        {
+          for (MutationKind button : buttons)
+          {
+            QueueUniqueLocked(MakePlan(
+                1, {MakeMutation(slot, button),
+                    MakeMutation(slot + 2, direction.kind, 1, direction.amount)}));
+            QueueUniqueLocked(MakePlan(
+                1, {MakeMutation(slot, direction.kind, 1, direction.amount),
+                    MakeMutation(slot + 2, button)}));
+          }
+        }
+      }
+    }
+  }
+
+  const int sequence_amount = *std::max_element(s_state.config.structured_poke_amounts.begin(),
+                                                s_state.config.structured_poke_amounts.end());
+  const std::vector<DirectionPoke> sequence_directions = DirectionPokes(sequence_amount);
+  for (u32 gap = 1; gap <= s_state.config.structured_max_gap_slots; ++gap)
+  {
+    const u64 frame_gap = static_cast<u64>(gap) * 2;
+    for (u64 slot : slots)
+    {
+      if (slot + frame_gap > s_state.effective_window_last)
+        continue;
+      for (const DirectionPoke& first : sequence_directions)
+      {
+        for (const DirectionPoke& second : sequence_directions)
+        {
+          QueueUniqueLocked(MakePlan(
+              1, {MakeMutation(slot, first.kind, 1, first.amount),
+                  MakeMutation(slot + frame_gap, second.kind, 1, second.amount)}));
+        }
+      }
+    }
+  }
+
+  OSD::AddTypedMessage(
+      OSD::MessageType::RE4DropSearch,
+      fmt::format("RE4 v9.0 structured scan | {} | {} deterministic plans",
+                  WorkerDescription(), s_state.queue.size() - before),
+      OSD::Duration::VERY_LONG, OSD::Color::CYAN);
+}
+
 void BuildCalibrationQueueLocked()
 {
+  if (s_state.config.structured_pokes)
+  {
+    BuildStructuredPokeQueueLocked();
+    s_state.calibration_built = true;
+    return;
+  }
   for (u64 slot : CalibrationSlotsLocked())
   {
     for (MutationKind kind : s_state.config.allowed_kinds)
@@ -2004,12 +2239,15 @@ void BuildCalibrationQueueLocked()
 
 void RecordCalibrationLocked(const Plan& plan, const Outcome& outcome)
 {
-  if (plan.phase != 1 || plan.mutations.size() != 1)
+  if (plan.phase != 1)
     return;
   if (Signature(outcome) != s_state.baseline_signature)
   {
-    s_state.effective_kinds.insert(plan.mutations[0].kind);
-    s_state.effective_slots.insert(plan.mutations[0].slot);
+    for (const Mutation& mutation : plan.mutations)
+    {
+      s_state.effective_kinds.insert(mutation.kind);
+      s_state.effective_slots.insert(mutation.slot);
+    }
   }
 }
 
@@ -2027,7 +2265,7 @@ void FinishCalibrationLocked()
   s_state.calibration_done = true;
   OSD::AddTypedMessage(
       OSD::MessageType::RE4DropSearch,
-      fmt::format("RE4 v8.0 calibration DONE | {} | {} kinds | {} active slots",
+      fmt::format("RE4 v9.0 calibration DONE | {} | {} kinds | {} active slots",
                   WorkerDescription(), s_state.effective_kinds.size(),
                   s_state.effective_slots.size()),
       OSD::Duration::VERY_LONG, OSD::Color::GREEN);
@@ -2093,7 +2331,7 @@ bool PrepareNextPlanLocked()
     s_state.validation_done = true;
     OSD::AddTypedMessage(
         OSD::MessageType::RE4DropSearch,
-        fmt::format("RE4 v8.0 validation PASSED | {} | {} drops | window {}-{}",
+        fmt::format("RE4 v9.0 validation PASSED | {} | {} drops | window {}-{}",
                     WorkerDescription(), s_state.validation_outcomes[0].completed_count,
                     s_state.config.window_first, s_state.effective_window_last),
         OSD::Duration::VERY_LONG, OSD::Color::GREEN);
@@ -2103,6 +2341,12 @@ bool PrepareNextPlanLocked()
   if (s_state.queue.empty() && s_state.validation_done && s_state.calibration_built)
   {
     FinishCalibrationLocked();
+    if (s_state.config.structured_pokes &&
+        s_state.config.structured_stop_if_no_gate_seed_change &&
+        s_state.seen_gate_seeds.size() <= 1)
+    {
+      return false;
+    }
     if (!BuildNextAdaptivePlanLocked())
       return false;
   }
@@ -2113,6 +2357,11 @@ bool PrepareNextPlanLocked()
   s_state.queue.pop_front();
   s_state.current_outcome = MakeOutcome();
   s_state.mutated_inputs.clear();
+  s_state.scheduled_polls = 0;
+  s_state.changed_polls = 0;
+  s_state.first_changed_frame = 0;
+  s_state.last_changed_frame = 0;
+  s_state.changed_state_hash = 0;
   s_state.attempt_start = std::chrono::steady_clock::now();
   return true;
 }
@@ -2151,7 +2400,7 @@ void CaptureOnCPUThread(System* system)
     {
       s_state.previous_speed = Config::Get(Config::MAIN_EMULATION_SPEED);
       s_state.validation_error = "emulated CPU/VBI overclock is enabled";
-      FinishSearchLocked(system, "RE4 v8.0 FAILED: disable emulated CPU/VBI overclock",
+      FinishSearchLocked(system, "RE4 v9.0 FAILED: disable emulated CPU/VBI overclock",
                          OSD::Color::RED);
       return;
     }
@@ -2164,7 +2413,7 @@ void CaptureOnCPUThread(System* system)
           "wrong DTM (got {} frames / {} inputs; expected {} / {})", movie.GetTotalFrames(),
           movie.GetTotalInputCount(), s_state.config.expected_movie_frames,
           s_state.config.expected_movie_inputs);
-      FinishSearchLocked(system, "RE4 v8.0 FAILED: DTM does not match the active profile",
+      FinishSearchLocked(system, "RE4 v9.0 FAILED: DTM does not match the active profile",
                          OSD::Color::RED);
       return;
     }
@@ -2175,7 +2424,7 @@ void CaptureOnCPUThread(System* system)
     std::lock_guard lock{s_mutex};
     if (snapshot.empty())
     {
-      FinishSearchLocked(system, "RE4 v8.0 FAILED: in-memory snapshot error", OSD::Color::RED);
+      FinishSearchLocked(system, "RE4 v9.0 FAILED: in-memory snapshot error", OSD::Color::RED);
       return;
     }
     s_state.snapshot = std::move(snapshot);
@@ -2188,7 +2437,7 @@ void CaptureOnCPUThread(System* system)
     {
       FinishSearchLocked(
           system,
-          fmt::format("RE4 v8.0 OUTPUT ERROR | {} | {}", WorkerDescription(),
+          fmt::format("RE4 v9.0 OUTPUT ERROR | {} | {}", WorkerDescription(),
                       s_state.output_error),
           OSD::Color::RED);
       return;
@@ -2197,19 +2446,19 @@ void CaptureOnCPUThread(System* system)
     s_state.search_start = std::chrono::steady_clock::now();
     if (!PrepareNextPlanLocked())
     {
-      FinishSearchLocked(system, "RE4 v8.0 FAILED: could not prepare validation",
+      FinishSearchLocked(system, "RE4 v9.0 FAILED: could not prepare validation",
                          OSD::Color::RED);
       return;
     }
     OSD::AddTypedMessage(
         OSD::MessageType::RE4DropSearch,
-        fmt::format("RE4 DROP SEARCH v8.0 {}START | {} | {} | F{} | budget {}",
+        fmt::format("RE4 DROP SEARCH v9.0 {}START | {} | {} | F{} | budget {}",
                     s_state.config.scout_enabled ? "SCOUT " : "", WorkerDescription(),
                     s_state.config.profile, s_state.config.capture_frame, s_state.config.budget),
         OSD::Duration::VERY_LONG, OSD::Color::GREEN);
     OSD::AddTypedMessage(
         OSD::MessageType::RE4DropSearchOutput,
-        fmt::format("RE4 v8.0 OUTPUT | {} | {}", WorkerDescription(), s_state.results_path),
+        fmt::format("RE4 v9.0 OUTPUT | {} | {}", WorkerDescription(), s_state.results_path),
         OSD::Duration::VERY_LONG, OSD::Color::CYAN);
   }
   system->GetCPU().Continue();
@@ -2228,7 +2477,7 @@ void RestoreOnCPUThread(System* system)
     s_state.restore_requested = false;
     if (!restored)
     {
-      FinishSearchLocked(system, "RE4 v8.0 FAILED: in-memory restore error", OSD::Color::RED);
+      FinishSearchLocked(system, "RE4 v9.0 FAILED: in-memory restore error", OSD::Color::RED);
       return;
     }
     if (!PrepareNextPlanLocked())
@@ -2236,7 +2485,7 @@ void RestoreOnCPUThread(System* system)
       if (!s_state.validation_done)
       {
         FinishSearchLocked(system,
-                           fmt::format("RE4 v8.0 validation FAILED | {} | {}",
+                           fmt::format("RE4 v9.0 validation FAILED | {} | {}",
                                        WorkerDescription(), s_state.validation_error),
                            OSD::Color::RED);
       }
@@ -2244,7 +2493,7 @@ void RestoreOnCPUThread(System* system)
       {
         FinishSearchLocked(
             system,
-            fmt::format("RE4 v8.0 DONE | {} | {} attempts | {} signatures",
+            fmt::format("RE4 v9.0 DONE | {} | {} attempts | {} signatures",
                         WorkerDescription(), s_state.attempts, s_state.seen_signatures.size()),
             OSD::Color::YELLOW);
       }
@@ -2318,14 +2567,14 @@ void CompleteAttempt(System* system, std::string status)
     if (new_grenade_route && s_state.route_corpus.size() <= 20)
     {
       OSD::AddTypedMessage(OSD::MessageType::RE4DropSearch,
-                           fmt::format("RE4 v8.0 GRENADE ROUTE | {} | attempt {} | parents {}",
+                           fmt::format("RE4 v9.0 GRENADE ROUTE | {} | attempt {} | parents {}",
                                        WorkerDescription(), attempts, s_state.route_corpus.size()),
                            OSD::Duration::VERY_LONG, OSD::Color::GREEN);
     }
     else if (new_money_route && s_state.money_corpus.size() <= 20)
     {
       OSD::AddTypedMessage(OSD::MessageType::RE4DropSearch,
-                           fmt::format("RE4 v8.0 MONEY ROUTE | {} | attempt {} | parents {}",
+                           fmt::format("RE4 v9.0 MONEY ROUTE | {} | attempt {} | parents {}",
                                        WorkerDescription(), attempts, s_state.money_corpus.size()),
                            OSD::Duration::VERY_LONG, OSD::Color::CYAN);
     }
@@ -2335,10 +2584,9 @@ void CompleteAttempt(System* system, std::string status)
       OSD::AddTypedMessage(
           OSD::MessageType::RE4DropSearch,
           fmt::format(
-              "RE4 v8.0 | {} | {} | {:.2f}/s | phase {} | cost {}/{} | corpus {} | G {} | P {} | MP {}",
+              "RE4 v9.0 | {} | {} | {:.2f}/s | phase {} | input {}/{} | corpus {} | G {} | P {} | MP {}",
               WorkerDescription(), attempts, rate, s_state.current_plan.phase,
-              s_state.current_plan.movement_cost_frames,
-              s_state.config.max_movement_cost_frames, s_state.corpus.size(),
+              s_state.changed_polls, s_state.scheduled_polls, s_state.corpus.size(),
               s_state.route_corpus.size(), s_state.money_corpus.size(),
               s_state.current_outcome.max_money_probe_stage),
           OSD::Duration::VERY_LONG, OSD::Color::CYAN);
@@ -2352,7 +2600,7 @@ void CompleteAttempt(System* system, std::string status)
     const std::string reason = found_reason.empty() ? "" : fmt::format(" | {}", found_reason);
     FinishSearchLocked(
         system,
-        fmt::format("RE4 v8.0 {} | {} | attempt {} | DTM {} | {}{}", result,
+        fmt::format("RE4 v9.0 {} | {} | attempt {} | DTM {} | {}{}", result,
                     WorkerDescription(), attempts, dtm_written ? "OK" : "ERROR", found_plan,
                     reason),
         OSD::Color::GREEN);
@@ -2401,19 +2649,19 @@ void ResetSession()
   if (!loaded)
   {
     OSD::AddTypedMessage(OSD::MessageType::RE4DropSearch,
-                         fmt::format("RE4 v8.0 CONFIG ERROR | {}", s_state.config_error),
+                         fmt::format("RE4 v9.0 CONFIG ERROR | {}", s_state.config_error),
                          OSD::Duration::VERY_LONG, OSD::Color::RED);
     return;
   }
   if (!s_state.config.enabled)
   {
-    OSD::AddTypedMessage(OSD::MessageType::RE4DropSearch, "RE4 drop search v8.0 disabled in INI",
+    OSD::AddTypedMessage(OSD::MessageType::RE4DropSearch, "RE4 drop search v9.0 disabled in INI",
                          OSD::Duration::NORMAL, OSD::Color::YELLOW);
     return;
   }
   OSD::AddTypedMessage(
       OSD::MessageType::RE4DropSearch,
-      fmt::format("RE4 drop search v8.0 armed | {} | {} | {} drops | target {}",
+      fmt::format("RE4 drop search v9.0 armed | {} | {} | {} drops | target {}",
                   WorkerDescription(), s_state.config.profile, s_state.config.expected_drops,
                   TargetDescription()),
       OSD::Duration::VERY_LONG, OSD::Color::GREEN);
@@ -2425,20 +2673,42 @@ void MutateMovieControllerState(u64 movie_frame, u64 movie_input_offset,
   std::lock_guard lock{s_mutex};
   if (!s_state.active || s_state.finished)
     return;
-  bool changed = false;
+  const Movie::ControllerState original = state;
+  bool scheduled = false;
   for (const Mutation& mutation : s_state.current_plan.mutations)
   {
     if (IsFrameInMutation(movie_frame, mutation))
     {
       ApplyMutation(state, mutation);
-      changed = true;
+      scheduled = true;
     }
   }
-  if (changed)
+  if (!scheduled)
+    return;
+
+  ++s_state.scheduled_polls;
+  if (std::memcmp(&original, &state, sizeof(state)) == 0)
+    return;
+
+  std::array<u8, sizeof(Movie::ControllerState)> bytes{};
+  std::memcpy(bytes.data(), &state, sizeof(state));
+  s_state.mutated_inputs[movie_input_offset] = bytes;
+  ++s_state.changed_polls;
+  if (s_state.first_changed_frame == 0)
   {
-    std::array<u8, sizeof(Movie::ControllerState)> bytes{};
-    std::memcpy(bytes.data(), &state, sizeof(state));
-    s_state.mutated_inputs[movie_input_offset] = bytes;
+    s_state.first_changed_frame = movie_frame;
+    s_state.changed_state_hash = 1469598103934665603ULL;
+  }
+  s_state.last_changed_frame = movie_frame;
+  for (int shift = 0; shift < 64; shift += 8)
+  {
+    s_state.changed_state_hash ^= static_cast<u8>(movie_input_offset >> shift);
+    s_state.changed_state_hash *= 1099511628211ULL;
+  }
+  for (u8 value : bytes)
+  {
+    s_state.changed_state_hash ^= value;
+    s_state.changed_state_hash *= 1099511628211ULL;
   }
 }
 
