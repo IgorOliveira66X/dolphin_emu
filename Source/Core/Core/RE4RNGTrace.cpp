@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include "Core/RE4RNGTrace.h"
+#include "Core/RE4DropResult.h"
 
 #include <array>
 #include <fstream>
@@ -56,6 +57,9 @@ struct TraceState
   u64 calls_this_poll = 0;
   u64 calls_previous_poll = 0;
   u64 drop_probe_index = 0;
+  u32 drop_item_address = 0;
+  u32 drop_quantity_address = 0;
+  bool drop_outputs_pending = false;
   u32 last_caller = 0;
   u16 last_seed_before = 0;
   u16 last_seed_after = 0;
@@ -144,12 +148,12 @@ void OpenTraceFiles()
   File::CreateFullPath(File::GetUserPath(D_LOGS_IDX));
   const std::string logs_path = File::GetUserPath(D_LOGS_IDX);
 
-  s_state.rng_log =
-      std::ofstream(logs_path + std::string(RNG_TRACE_FILENAME), std::ios::out | std::ios::trunc);
-  s_state.pad_log =
-      std::ofstream(logs_path + std::string(PAD_TRACE_FILENAME), std::ios::out | std::ios::trunc);
-  s_state.drop_log =
-      std::ofstream(logs_path + std::string(DROP_TRACE_FILENAME), std::ios::out | std::ios::trunc);
+  File::OpenFStream(s_state.rng_log, logs_path + std::string(RNG_TRACE_FILENAME),
+                    std::ios::out | std::ios::trunc);
+  File::OpenFStream(s_state.pad_log, logs_path + std::string(PAD_TRACE_FILENAME),
+                    std::ios::out | std::ios::trunc);
+  File::OpenFStream(s_state.drop_log, logs_path + std::string(DROP_TRACE_FILENAME),
+                    std::ios::out | std::ios::trunc);
 
   if (s_state.rng_log)
   {
@@ -174,7 +178,8 @@ void OpenTraceFiles()
         << "probe_index,frame,input_count,poll_index,pc,label,seed,lr,ctr,cr,xer,"
            "buttons,stick_x,stick_y,cstick_x,cstick_y,trigger_l,trigger_r,analog_a,analog_b,"
            "r0,r1,r2,r3,r4,r5,r6,r7,r8,r9,r10,r11,r12,r13,r14,r15,r16,r17,r18,r19,"
-           "r20,r21,r22,r23,r24,r25,r26,r27,r28,r29,r30,r31\n";
+           "r20,r21,r22,r23,r24,r25,r26,r27,r28,r29,r30,r31,"
+           "drop_result,drop_item_id,drop_item_quantity\n";
     s_state.drop_log.flush();
   }
 }
@@ -256,7 +261,7 @@ void ResetSession()
   Core::RE4RNGSearch::ResetSession();
   OSD::AddTypedMessage(
       OSD::MessageType::RE4RNGTrace,
-      fmt::format("RE4 JPN RNG tracer v2 armed | RNG ${:08X} | seed ${:08X} | drop probes ON",
+      fmt::format("RE4 JPN RNG tracer v2 armed | RNG ${:08X} | seed ${:08X} | drop probes ON | final item outputs v3",
                   RNG_FUNCTION_ADDRESS, RNG_STATE_ADDRESS),
       OSD::Duration::VERY_LONG, OSD::Color::GREEN);
 }
@@ -367,6 +372,30 @@ void OnDropProbeEntry(System* system, u32 pc)
   EnsureActive();
   ++s_state.drop_probe_index;
 
+  if (pc == 0x800D2794)
+  {
+    s_state.drop_item_address = ppc_state.gpr[4];
+    s_state.drop_quantity_address = ppc_state.gpr[5];
+    s_state.drop_outputs_pending = true;
+  }
+
+  std::optional<DropResult> final_result;
+  if (pc == 0x800D2FF8)
+  {
+    // This checkpoint precedes the epilogue: r3 is the return value and r26/r27
+    // still hold the output pointers. Check them against this invocation's arguments
+    // so an interrupted call / savestate cannot associate unrelated stack contents.
+    if (s_state.drop_outputs_pending &&
+        s_state.drop_item_address == ppc_state.gpr[27] &&
+        s_state.drop_quantity_address == ppc_state.gpr[26])
+    {
+      final_result = ReadDropResult(
+          ppc_state.gpr[3], s_state.drop_item_address, s_state.drop_quantity_address,
+          [system](u32 address) { return system->GetMemory().Read_U32(address); });
+    }
+    s_state.drop_outputs_pending = false;
+  }
+
   if (!s_state.drop_log)
     return;
 
@@ -385,8 +414,22 @@ void OnDropProbeEntry(System* system, u32 pc)
       s_state.drop_log << ',';
     s_state.drop_log << fmt::format("${:08X}", ppc_state.gpr[i]);
   }
+  s_state.drop_log << ',';
+  if (final_result)
+  {
+    s_state.drop_log << (final_result->selected ? 1 : 0);
+    if (final_result->selected)
+      s_state.drop_log << fmt::format(",${:08X},{}", final_result->item, final_result->quantity);
+    else
+      s_state.drop_log << ",,";
+  }
+  else
+  {
+    s_state.drop_log << ",,";
+  }
   s_state.drop_log << '\n';
   s_state.drop_log.flush();
 }
 
 }  // namespace Core::RE4RNGTrace
+
